@@ -1,1 +1,248 @@
+%% ========== 基于文档第二章算法的非球面姿态求解 ==========
+clear; clc; close all;
+
+%% 第一步: 生成初始非球面点云 (参考式2.27)
+% 非球面参数
+R = 1000;              % 顶点曲率半径 (mm) - 文档中R=1000
+k = -2;                % 二次常数 K=-2 (双曲面,表2.2)
+A4 = 0;                % 4阶系数(可选,文档式2.27)
+aperture_radius = 150; % 有效口径半径 (mm) - 300×300口径
+
+% 非球面矢高计算函数 (式2.27)
+asphere_sag = @(rho, R, K, A4) ...
+    (rho.^2 / R) ./ (1 + sqrt(1 - (1+K) * rho.^2 / R^2)) + A4 * rho.^4;
+
+% 生成4×4测量点分布 (参考3.3.2节测量策略)
+num_radial = 4;
+num_angular = 4;
+r_sample = linspace(aperture_radius*0.3, aperture_radius*0.9, num_radial);
+theta_sample = linspace(0, 2*pi, num_angular+1);
+theta_sample = theta_sample(1:end-1);
+
+% 在工件坐标系C_M下生成测量点 (图2.1)
+Q_init = [];  % 对应文档中的q_i
+for i = 1:num_radial
+    for j = 1:num_angular
+        x_i = r_sample(i) * cos(theta_sample(j));
+        y_i = r_sample(i) * sin(theta_sample(j));
+        rho = sqrt(x_i^2 + y_i^2);
+        z_i = asphere_sag(rho, R, k, A4);
+        Q_init = [Q_init; x_i, y_i, z_i];
+    end
+end
+
+N = size(Q_init, 1);  % 测量点数量
+fprintf('工件坐标系C_M下理想点集Q: %d个点\n', N);
+
+%% 第二步: 施加已知变换得到机床坐标系C_W下的测量点 (式2.1-2.2)
+% 设定真实变换参数 (对应SE(3)群)
+alpha_true = 5;   % 绕X轴转角 (度)
+beta_true = 3;    % 绕Y轴转角 (度)
+p_true = [10; -8; 10];  % 平移向量 (mm) - 文档中示例
+
+% 构建旋转矩阵R (式2.1, SE(3)元素)
+Rx = [1, 0, 0;
+      0, cosd(alpha_true), -sind(alpha_true);
+      0, sind(alpha_true), cosd(alpha_true)];
+  
+Ry = [cosd(beta_true), 0, sind(beta_true);
+      0, 1, 0;
+      -sind(beta_true), 0, cosd(beta_true)];
+
+R_true = Ry * Rx;  % 复合旋转
+
+% 构建齐次变换矩阵g (式2.2)
+g_true = [R_true, p_true; 0, 0, 0, 1];
+
+% 变换到机床坐标系C_W (对应文档中的p_i)
+P_measured = (R_true * Q_init')' + p_true';  % 式(2.8)中的P
+
+fprintf('\n真实空间变换参数:\n');
+fprintf('旋转: α=%.2f°, β=%.2f°\n', alpha_true, beta_true);
+fprintf('平移: p=[%.1f, %.1f, %.1f]mm\n', p_true);
+
+%% 第三步: 添加测量误差 (参考2.4.1节)
+% 式(2.31): 测量误差服从N(0, 0.01^2) mm
+noise_std = 0.01;  % 10μm标准差
+measurement_noise = noise_std * randn(size(P_measured));
+P_measured = P_measured + measurement_noise;
+
+fprintf('测量误差: σ=%.2fmm (10μm)\n', noise_std);
+
+%% 第四步: SVD算法求解变换矩阵 (参考2.2.2节)
+% 【方法1】Brockett's SVD算法 (文档提到的[22])
+
+% 计算质心
+centroid_P = mean(P_measured, 1)';  % 测量点质心
+centroid_Q = mean(Q_init, 1)';      % 模型点质心
+
+% 去质心
+P_centered = P_measured - centroid_P';
+Q_centered = Q_init - centroid_Q';
+
+% 构建协方差矩阵H (SVD算法核心)
+H = Q_centered' * P_centered;  % 3×3矩阵
+
+% 奇异值分解
+[U, ~, V] = svd(H);
+
+% 求解旋转矩阵 (确保det(R)=1)
+R_estimated = V * U';
+if det(R_estimated) < 0  % 防止反射
+    V(:, 3) = -V(:, 3);
+    R_estimated = V * U';
+end
+
+% 求解平移向量
+p_estimated = centroid_Q - R_estimated * centroid_P;
+
+% 构建估计的齐次变换矩阵
+g_estimated = [R_estimated, p_estimated; 0, 0, 0, 1];
+
+fprintf('\n========== SVD算法求解结果 ==========\n');
+
+%% 第五步: 从旋转矩阵提取欧拉角 (式2.29)
+% ZYX欧拉角分解 (对应Tangent算法)
+beta_est = asind(-R_estimated(1,3));
+alpha_est = atan2d(R_estimated(2,3), R_estimated(3,3));
+gamma_est = atan2d(R_estimated(1,2), R_estimated(1,1));  % Rz(应≈0)
+
+fprintf('估计旋转角度:\n');
+fprintf('  α(Rx) = %.4f° (真值: %.2f°)\n', alpha_est, alpha_true);
+fprintf('  β(Ry) = %.4f° (真值: %.2f°)\n', beta_est, beta_true);
+fprintf('  γ(Rz) = %.4f° (理论应≈0,不可观测)\n', gamma_est);
+fprintf('估计平移向量:\n');
+fprintf('  p = [%.4f, %.4f, %.4f]mm\n', p_estimated);
+fprintf('  真值: [%.1f, %.1f, %.1f]mm\n', p_true);
+
+%% 第六步: 误差分析 (式2.8, 2.30)
+% 计算准则函数e(g,Q) (式2.8)
+residuals = vecnorm((R_estimated * Q_init')' + p_estimated' - P_measured, 2, 2);
+e_g = sum(residuals.^2);  % 式(2.8)的目标函数
+
+fprintf('\n========== 误差分析 ==========\n');
+fprintf('准则函数e(g,Q) = %.6f mm²\n', e_g);
+fprintf('RMSE = %.6f mm\n', sqrt(e_g / N));
+fprintf('最大残差 = %.6f mm\n', max(residuals));
+
+% 精度指标E(η) (式2.30)
+eta_true = [p_true; alpha_true; beta_true; 0];
+eta_est = [p_estimated; alpha_est; beta_est; gamma_est];
+E_eta = norm(eta_true - eta_est);
+
+fprintf('精度指标E(η) = %.6f\n', E_eta);
+fprintf('旋转角度误差: Δα=%.4f°, Δβ=%.4f°\n', ...
+    abs(alpha_est - alpha_true), abs(beta_est - beta_true));
+fprintf('平移误差: Δp=[%.4f, %.4f, %.4f]mm\n', ...
+    abs(p_estimated - p_true));
+
+%% 第七步: 对比Hong-Tan算法 (文档2.2.2节式2.14)
+% Hong-Tan算法需要法向量,这里简化实现
+% 计算每个测量点的法向量 n_i (式2.14)
+normals_Q = zeros(N, 3);
+for i = 1:N
+    x_i = Q_init(i, 1);
+    y_i = Q_init(i, 2);
+    rho_i = sqrt(x_i^2 + y_i^2);
+    
+    % 非球面法向量: [-∂z/∂x, -∂z/∂y, 1] (归一化)
+    c = 1/R;
+    denom_sqrt = sqrt(1 - (1+k)*c^2*rho_i^2);
+    
+    dz_dx = x_i * c / denom_sqrt + 4*A4*x_i*rho_i^2;
+    dz_dy = y_i * c / denom_sqrt + 4*A4*y_i*rho_i^2;
+    
+    n_vec = [-dz_dx; -dz_dy; 1];
+    normals_Q(i, :) = (n_vec / norm(n_vec))';
+end
+
+% Hong-Tan迭代 (简化版,1次迭代演示)
+% 构建矩阵A和向量b (式2.14)
+A_ht = zeros(6, 6);
+b_ht = zeros(6, 1);
+
+for i = 1:N
+    n_i = normals_Q(i, :)';
+    q_i = Q_init(i, :)';
+    p_i = P_measured(i, :)';
+    
+    % 叉乘矩阵 n_i × q_i
+    q_cross_n = cross(q_i, n_i);
+    
+    % 式(2.14)
+    A_ht = A_ht + [n_i * n_i', n_i * q_cross_n';
+                   q_cross_n * n_i', q_cross_n * q_cross_n'];
+    
+    b_ht = b_ht + [n_i; q_cross_n] * (n_i' * (p_i - q_i));
+end
+
+% 求解运动旋量坐标ξ
+xi_ht = A_ht \ b_ht;  % 6×1向量
+
+fprintf('\n========== Hong-Tan算法结果 ==========\n');
+fprintf('运动旋量ξ = [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f]^T\n', xi_ht);
+fprintf('(前3项:平移ν, 后3项:旋转ω)\n');
+
+%% 第八步: 可视化 (参考图2.7)
+figure('Position', [100, 100, 1600, 500]);
+
+% 子图1: 寻位前 (类似图2.7(a))
+subplot(1,3,1);
+plot3(Q_init(:,1), Q_init(:,2), Q_init(:,3), 'bo', 'MarkerSize', 8, 'LineWidth', 1.5);
+hold on;
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), 'r^', 'MarkerSize', 8, 'LineWidth', 1.5);
+xlabel('X (mm)', 'FontSize', 11);
+ylabel('Y (mm)', 'FontSize', 11);
+zlabel('Z (mm)', 'FontSize', 11);
+title('寻位前', 'FontSize', 13, 'FontWeight', 'bold');
+legend('模型点Q (C_M)', '测量点P (C_W)', 'Location', 'best');
+grid on; axis equal;
+view(45, 30);
+
+% 子图2: 寻位后 (类似图2.7(b))
+subplot(1,3,2);
+Q_transformed = (R_estimated * Q_init')' + p_estimated';
+plot3(Q_transformed(:,1), Q_transformed(:,2), Q_transformed(:,3), 'go', 'MarkerSize', 8, 'LineWidth', 1.5);
+hold on;
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), 'r^', 'MarkerSize', 8, 'LineWidth', 1.5);
+% 绘制匹配连线
+for i = 1:N
+    plot3([Q_transformed(i,1), P_measured(i,1)], ...
+          [Q_transformed(i,2), P_measured(i,2)], ...
+          [Q_transformed(i,3), P_measured(i,3)], 'k--', 'LineWidth', 0.5);
+end
+xlabel('X (mm)', 'FontSize', 11);
+ylabel('Y (mm)', 'FontSize', 11);
+zlabel('Z (mm)', 'FontSize', 11);
+title('寻位后 (SVD配准)', 'FontSize', 13, 'FontWeight', 'bold');
+legend('配准后Q', '测量点P', 'Location', 'best');
+grid on; axis equal;
+view(45, 30);
+
+% 子图3: 残差分析 (类似图2.8)
+subplot(1,3,3);
+scatter3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+         150, residuals*1000, 'filled', 'MarkerEdgeColor', 'k');
+colormap('jet');
+c = colorbar;
+c.Label.String = '残差 (μm)';
+c.Label.FontSize = 11;
+xlabel('X (mm)', 'FontSize', 11);
+ylabel('Y (mm)', 'FontSize', 11);
+zlabel('Z (mm)', 'FontSize', 11);
+title(sprintf('配准残差分布\nRMSE=%.2fμm', sqrt(e_g/N)*1000), ...
+      'FontSize', 13, 'FontWeight', 'bold');
+grid on; axis equal;
+view(45, 30);
+
+%% 第九步: 输出齐次变换矩阵 (式2.2格式)
+fprintf('\n========== 齐次变换矩阵g ∈ SE(3) ==========\n');
+fprintf('真实矩阵g_true:\n');
+disp(g_true);
+fprintf('估计矩阵g_estimated:\n');
+disp(g_estimated);
+
+% 计算矩阵差的Frobenius范数
+matrix_error = norm(g_true - g_estimated, 'fro');
+fprintf('矩阵误差 ||g_true - g_est||_F = %.6f\n', matrix_error);
 
