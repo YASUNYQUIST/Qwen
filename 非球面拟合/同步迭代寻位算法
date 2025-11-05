@@ -1,0 +1,1464 @@
+%% ========================================================================
+%% 非球面工件位姿求解 - 详细注释版 (适合新手学习)
+%% 实现文档2.3节迭代优化 + 2.4节仿真验证
+%% ========================================================================
+clear;      % 清除工作区所有变量
+clc;        % 清空命令行窗口
+close all;  % 关闭所有图形窗口
+
+%% ========================================================================
+%% 第一部分: 参数设置 (对应文档2.4.1节 表2.2)
+%% ========================================================================
+fprintf('========== 开始仿真 ==========\n\n');
+
+% --- 非球面几何参数 ---
+% 非球面方程: z = (c*ρ²)/(1+√(1-(1+K)c²ρ²)) + A4*ρ⁴ + A6*ρ⁶
+% 其中: c=1/R (曲率), ρ=√(x²+y²) (径向距离)
+
+R = 1000;              % 顶点曲率半径 (mm) - 控制曲面弯曲程度
+                       % R越大,曲面越平缓
+                       
+K = -2;                % 二次常数 (圆锥系数)
+                       % K=-1: 抛物面
+                       % K<-1: 双曲面 (本例)
+                       % K>0:  扁椭球
+                       
+A4 = 0;                % 4阶非球面系数 (控制高阶偏离)
+A6 = 0;                % 6阶非球面系数
+aperture_size = 300;   % 非球面口径 (mm) - 300×300mm方形口径
+
+% --- 真实位姿参数 (文档表2.3) ---
+% 这是"真实"的工件放置姿态,仿真时已知,实际测量时未知
+alpha_true = 2;        % 绕X轴倾斜角度 (度) - 俯仰角
+beta_true = 1.5;       % 绕Y轴倾斜角度 (度) - 偏航角
+px_true = 10;          % X方向平移 (mm)
+py_true = -8;          % Y方向平移 (mm)
+pz_true = 10;          % Z方向平移 (mm)
+
+% --- 测量误差参数 ---
+sigma_noise = 0.01;    % 测量标准差 (mm) - 模拟测头10微米误差
+
+% 输出设置信息
+fprintf('【仿真参数】\n');
+fprintf('  非球面: R=%d mm, K=%.1f\n', R, K);
+fprintf('  口径: %d×%d mm\n', aperture_size, aperture_size);
+fprintf('  真实位姿: α=%.1f°, β=%.1f°\n', alpha_true, beta_true);
+fprintf('           平移=[%.1f, %.1f, %.1f] mm\n', px_true, py_true, pz_true);
+fprintf('  测量误差: σ=%.2f mm (%.0f μm)\n\n', sigma_noise, sigma_noise*1000);
+
+%% ========================================================================
+%% 第二部分: 生成测量点 (对应文档2.4.2节)
+%% ========================================================================
+
+% --- 2.1 选择采样方案 ---
+% 定义三种测点分布方案
+sampling_schemes = {
+    struct('name', '3×3网格(9点)',  'grid', 3),   % 稀疏采样
+    struct('name', '5×5网格(25点)', 'grid', 5),   % 中等采样(推荐)
+    struct('name', '7×7网格(49点)', 'grid', 7)    % 密集采样
+};
+
+scheme_idx = 2;  % 选择第2种方案 (可改为1或3试验不同效果)
+scheme = sampling_schemes{scheme_idx};
+grid_size = scheme.grid;  % 网格大小: 5×5
+
+fprintf('【测点分布】\n');
+fprintf('  方案: %s\n', scheme.name);
+
+% --- 2.2 生成均匀网格坐标 ---
+% linspace(起点, 终点, 点数) - 生成等间距数组
+x_range = linspace(-aperture_size/2, aperture_size/2, grid_size);
+y_range = linspace(-aperture_size/2, aperture_size/2, grid_size);
+
+% meshgrid - 将1D数组扩展为2D网格
+% 例如: x_range=[-150, -75, 0, 75, 150]
+%       生成5×5网格,X_grid的每一行都是[-150,-75,0,75,150]
+[X_grid, Y_grid] = meshgrid(x_range, y_range);
+
+% --- 2.3 计算非球面Z坐标 (式2.27) ---
+% 对网格上每个点(x,y)计算对应的z值
+Z_grid = zeros(size(X_grid));  % 预分配内存
+
+for i = 1:size(X_grid, 1)      % 遍历每一行
+    for j = 1:size(X_grid, 2)  % 遍历每一列
+        x = X_grid(i, j);
+        y = Y_grid(i, j);
+        
+        % 计算径向距离
+        rho = sqrt(x^2 + y^2);
+        
+        % 非球面公式 (式2.27)
+        c = 1 / R;  % 曲率
+        discriminant = 1 - (1 + K) * c^2 * rho^2;  % 判别式
+        
+        if discriminant >= 0  % 确保根号内非负
+            Z_grid(i, j) = (c * rho^2) / (1 + sqrt(discriminant)) + ...
+                           A4 * rho^4 + A6 * rho^6;
+        else
+            Z_grid(i, j) = NaN;  % 无效点标记为NaN
+        end
+    end
+end
+
+% --- 2.4 应用圆形口径掩膜 ---
+% 只保留口径内的点 (√(x²+y²) ≤ aperture_size/2)
+R_grid = sqrt(X_grid.^2 + Y_grid.^2);  % 每个点到中心的距离
+mask = R_grid <= aperture_size/2;       % 布尔矩阵: 1=有效, 0=超出口径
+
+% --- 2.5 提取有效测点为N×3矩阵 ---
+% 这是理想的模型点集Q (在工件坐标系C_M下)
+Q_model = [X_grid(mask), Y_grid(mask), Z_grid(mask)];
+N_points = size(Q_model, 1);  % 测点总数
+
+fprintf('  有效测点数: N=%d\n\n', N_points);
+
+%% ========================================================================
+%% 第三部分: 模拟真实测量 (生成机床坐标系C_W下的测量点P)
+%% ========================================================================
+fprintf('【生成测量数据】\n');
+
+% --- 3.1 构建真实旋转矩阵 R_true ---
+% 绕X轴旋转矩阵 (俯仰)
+Rx_true = [1,              0,                 0;
+           0,  cosd(alpha_true), -sind(alpha_true);
+           0,  sind(alpha_true),  cosd(alpha_true)];
+
+% 绕Y轴旋转矩阵 (偏航)       
+Ry_true = [cosd(beta_true),  0,  sind(beta_true);
+           0,                1,                 0;
+          -sind(beta_true),  0,  cosd(beta_true)];
+
+% 复合旋转 (先绕X再绕Y)
+R_true = Ry_true * Rx_true;
+
+% 平移向量
+p_true = [px_true; py_true; pz_true];  % 3×1列向量
+
+% --- 3.2 坐标变换 (式2.8) ---
+% 将工件坐标系C_M下的模型点Q变换到机床坐标系C_W
+% P = R * Q' + p  (注意: Q'表示Q的转置,因为Q是N×3,需要转为3×N)
+P_ideal = (R_true * Q_model')' + p_true';  % 理想测量点 (无噪声)
+
+% --- 3.3 添加测量噪声 (式2.31) ---
+% randn生成标准正态分布随机数,乘以sigma得到N(0,σ²)噪声
+measurement_noise = sigma_noise * randn(size(P_ideal));
+P_measured = P_ideal + measurement_noise;  % 实际测量点 (有噪声)
+
+fprintf('  测量点生成完成 (已添加%.0f μm噪声)\n\n', sigma_noise*1000);
+
+%% ========================================================================
+%% 第四部分: Newton-Gauss迭代法求解 (文档2.3.1节)
+%% ========================================================================
+fprintf('========== 算法1: Newton-Gauss迭代法 ==========\n');
+
+% --- 4.1 初始猜测值 (式2.18) ---
+% 实际中通常从零位姿开始迭代
+alpha_0 = 0;     % 初始倾斜角 (度)
+beta_0 = 0;
+p_0 = [0; 0; 0]; % 初始平移 (mm)
+
+% --- 4.2 迭代控制参数 ---
+max_iter = 50;         % 最大迭代次数
+tolerance = 1e-6;      % 收敛判据: 当e(η)<tolerance时停止
+
+% --- 4.3 记录迭代历史 (用于绘图) ---
+history_NG = struct();  % 创建空结构体
+history_NG.alpha = [];  % 每次迭代的α值
+history_NG.beta = [];   % 每次迭代的β值
+history_NG.px = [];     % 每次迭代的px值
+history_NG.py = [];
+history_NG.pz = [];
+history_NG.error = [];  % 每次迭代的准则函数值
+
+% --- 4.4 初始化当前估计值 ---
+alpha_k = alpha_0;  % k代表第k次迭代
+beta_k = beta_0;
+p_k = p_0;
+
+% 输出表头
+fprintf('初值: α=%.2f°, β=%.2f°, p=[%.1f,%.1f,%.1f]mm\n', ...
+    alpha_0, beta_0, p_0);
+fprintf('收敛条件: e(η) < %.2e\n\n', tolerance);
+fprintf('Iter\t α(°)\t\t β(°)\t\t ||p||(mm)\t e(η)\n');
+fprintf('------------------------------------------------------------\n');
+
+% --- 4.5 开始迭代 ---
+for iter = 1:max_iter
+    
+    % ===== 步骤1: 构建当前旋转矩阵 R_k =====
+    Rx_k = [1,            0,               0;
+            0,  cosd(alpha_k), -sind(alpha_k);
+            0,  sind(alpha_k),  cosd(alpha_k)];
+        
+    Ry_k = [cosd(beta_k),  0,  sind(beta_k);
+            0,             1,              0;
+           -sind(beta_k),  0,  cosd(beta_k)];
+    
+    R_k = Ry_k * Rx_k;  % 当前估计的旋转矩阵
+    
+    % ===== 步骤2: 计算残差向量 r_i (式2.17) =====
+    % r_i = R_k^T * (p_i - p_k) - q_i
+    % 物理意义: 将测量点p_i变换回工件坐标系,与模型点q_i的偏差
+    residuals = zeros(N_points, 3);  % 预分配N×3矩阵
+    
+    for i = 1:N_points
+        q_i = Q_model(i, :)';       % 模型点 (3×1列向量)
+        p_i = P_measured(i, :)';    % 测量点 (3×1列向量)
+        
+        % 计算残差 (向量形式)
+        r_i = R_k' * (p_i - p_k) - q_i;
+        residuals(i, :) = r_i';     % 存储为行向量
+    end
+    
+    % ===== 步骤3: 计算准则函数 e(η) =====
+    % e(η) = Σ ||r_i||² (所有残差的平方和)
+    e_k = sum(sum(residuals.^2));  % 双重sum: 先对列求和,再对行求和
+    
+    % ===== 步骤4: 记录本次迭代结果 =====
+    history_NG.alpha(iter) = alpha_k;
+    history_NG.beta(iter) = beta_k;
+    history_NG.px(iter) = p_k(1);
+    history_NG.py(iter) = p_k(2);
+    history_NG.pz(iter) = p_k(3);
+    history_NG.error(iter) = e_k;
+    
+    % 输出当前状态
+    fprintf('%2d\t %.6f\t %.6f\t %.6f\t %.6e\n', ...
+        iter, alpha_k, beta_k, norm(p_k), e_k);
+    
+    % ===== 步骤5: 判断收敛 =====
+    if e_k < tolerance
+        fprintf('\n✓ 收敛! 经过%d次迭代达到精度要求\n', iter);
+        break;  % 跳出循环
+    end
+    
+    % ===== 步骤6: 构建Jacobian矩阵 J (式2.23) =====
+    % J是 (3N)×5 矩阵,对应5个未知数: [Δα, Δβ, Δpx, Δpy, Δpz]
+    % 每个测点贡献3行 (对应x,y,z方向的残差)
+    
+    J = zeros(3*N_points, 5);  % 预分配Jacobian矩阵
+    r_vec = reshape(residuals', [], 1);  % 将N×3展平为(3N)×1列向量
+    
+    for i = 1:N_points
+        q_i = Q_model(i, :)';
+        p_i = P_measured(i, :)';
+        
+        % --- 计算 ∂r/∂α (对α的偏导数) ---
+        % 需要先计算 ∂R/∂α
+        dRx_dalpha = [0,             0,               0;
+                      0, -sind(alpha_k), -cosd(alpha_k);
+                      0,  cosd(alpha_k), -sind(alpha_k)] * (pi/180);  % 度转弧度
+        
+        dR_dalpha = Ry_k * dRx_dalpha;  % 链式法则
+        
+        % --- 计算 ∂r/∂β ---
+        dRy_dbeta = [-sind(beta_k),  0,  cosd(beta_k);
+                                  0,  0,              0;
+                     -cosd(beta_k),  0, -sind(beta_k)] * (pi/180);
+        
+        dR_dbeta = dRy_dbeta * Rx_k;
+        
+        % --- 填充Jacobian矩阵 ---
+        row_idx = (i-1)*3 + 1;  % 当前测点对应的起始行索引
+        
+        % 第1列: ∂r/∂α
+        J(row_idx:row_idx+2, 1) = dR_dalpha' * (p_i - p_k);
+        
+        % 第2列: ∂r/∂β
+        J(row_idx:row_idx+2, 2) = dR_dbeta' * (p_i - p_k);
+        
+        % 第3-5列: ∂r/∂p = -R_k^T
+        J(row_idx:row_idx+2, 3:5) = -R_k';
+    end
+    
+    % ===== 步骤7: Newton-Gauss更新 (式2.24) =====
+    % Δη = -(J^T * J)^(-1) * (J^T * r)
+    % 这是最小二乘法的标准形式
+    
+    delta_eta = -(J' * J) \ (J' * r_vec);  % \表示左除(求解线性方程组)
+    
+    % ===== 步骤8: 更新参数 =====
+    alpha_k = alpha_k + delta_eta(1);  % 新α = 旧α + Δα
+    beta_k = beta_k + delta_eta(2);
+    p_k = p_k + delta_eta(3:5);        % 向量加法
+    
+    % 防止超过最大迭代次数
+    if iter == max_iter
+        fprintf('\n⚠ 警告: 达到最大迭代次数(%d)未收敛!\n', max_iter);
+    end
+end
+
+% --- 4.6 保存最终结果 ---
+R_NG = Ry_k * Rx_k;  % 最终旋转矩阵
+p_NG = p_k;          % 最终平移向量
+
+% --- 4.7 输出结果分析 ---
+fprintf('\n【Newton-Gauss法结果】\n');
+fprintf('  估计位姿:\n');
+fprintf('    α = %.6f° (真值: %.2f°)\n', alpha_k, alpha_true);
+fprintf('    β = %.6f° (真值: %.2f°)\n', beta_k, beta_true);
+fprintf('    p = [%.6f, %.6f, %.6f] mm\n', p_k);
+fprintf('  误差:\n');
+fprintf('    Δα = %.6f° (%.3f 角秒)\n', ...
+    abs(alpha_k - alpha_true), abs(alpha_k - alpha_true)*3600);
+fprintf('    Δβ = %.6f° (%.3f 角秒)\n', ...
+    abs(beta_k - beta_true), abs(beta_k - beta_true)*3600);
+fprintf('    Δp = [%.6f, %.6f, %.6f] mm\n', abs(p_k - p_true));
+fprintf('  准则函数: e(η) = %.6e\n', e_k);
+fprintf('  RMSE = %.6f mm (%.2f μm)\n\n', ...
+    sqrt(e_k/N_points), sqrt(e_k/N_points)*1000);
+
+%% ========================================================================
+%% 第五部分: Levenberg-Marquardt迭代法 (文档2.3.2节)
+%% ========================================================================
+fprintf('========== 算法2: Levenberg-Marquardt法 ==========\n');
+
+% --- 5.1 初始化 ---
+alpha_lm = alpha_0;  % 同样从零位姿开始
+beta_lm = beta_0;
+p_lm = p_0;
+lambda = 0.01;       % 阻尼因子初值 (式2.26)
+
+history_LM = struct();
+history_LM.alpha = [];
+history_LM.beta = [];
+history_LM.px = [];
+history_LM.py = [];
+history_LM.pz = [];
+history_LM.error = [];
+history_LM.lambda = [];  % 记录阻尼因子变化
+
+fprintf('初始阻尼因子: λ=%.4f\n\n', lambda);
+fprintf('Iter\t α(°)\t\t β(°)\t\t ||p||(mm)\t e(η)\t\t λ\n');
+fprintf('------------------------------------------------------------------------\n');
+
+% --- 5.2 LM迭代 ---
+for iter = 1:max_iter
+    
+    % ===== 步骤1-4: 同Newton-Gauss =====
+    Rx_lm = [1,             0,                0;
+             0,  cosd(alpha_lm), -sind(alpha_lm);
+             0,  sind(alpha_lm),  cosd(alpha_lm)];
+         
+    Ry_lm = [cosd(beta_lm),  0,  sind(beta_lm);
+             0,              1,               0;
+            -sind(beta_lm),  0,  cosd(beta_lm)];
+    
+    R_lm = Ry_lm * Rx_lm;
+    
+    % 计算残差
+    residuals = zeros(N_points, 3);
+    for i = 1:N_points
+        q_i = Q_model(i, :)';
+        p_i = P_measured(i, :)';
+        residuals(i, :) = (R_lm' * (p_i - p_lm) - q_i)';
+    end
+    
+    e_lm = sum(sum(residuals.^2));
+    
+    % 记录历史
+    history_LM.alpha(iter) = alpha_lm;
+    history_LM.beta(iter) = beta_lm;
+    history_LM.px(iter) = p_lm(1);
+    history_LM.py(iter) = p_lm(2);
+    history_LM.pz(iter) = p_lm(3);
+    history_LM.error(iter) = e_lm;
+    history_LM.lambda(iter) = lambda;
+    
+    fprintf('%2d\t %.6f\t %.6f\t %.6f\t %.6e\t %.4f\n', ...
+        iter, alpha_lm, beta_lm, norm(p_lm), e_lm, lambda);
+    
+    if e_lm < tolerance
+        fprintf('\n✓ 收敛! 经过%d次迭代达到精度要求\n', iter);
+        break;
+    end
+    
+    % ===== 步骤5: 构建Jacobian (同N-G) =====
+    J = zeros(3*N_points, 5);
+    r_vec = reshape(residuals', [], 1);
+    
+    for i = 1:N_points
+        q_i = Q_model(i, :)';
+        p_i = P_measured(i, :)';
+        
+        dRx_dalpha = [0,              0,                0;
+                      0, -sind(alpha_lm), -cosd(alpha_lm);
+                      0,  cosd(alpha_lm), -sind(alpha_lm)] * (pi/180);
+        dR_dalpha = Ry_lm * dRx_dalpha;
+        
+        dRy_dbeta = [-sind(beta_lm),  0,  cosd(beta_lm);
+                                   0,  0,              0;
+                     -cosd(beta_lm),  0, -sind(beta_lm)] * (pi/180);
+        dR_dbeta = dRy_dbeta * Rx_lm;
+        
+        row_idx = (i-1)*3 + 1;
+        J(row_idx:row_idx+2, 1) = dR_dalpha' * (p_i - p_lm);
+        J(row_idx:row_idx+2, 2) = dR_dbeta' * (p_i - p_lm);
+        J(row_idx:row_idx+2, 3:5) = -R_lm';
+    end
+    
+    % ===== 步骤6: LM更新 (式2.26) =====
+    % 【关键区别】加入阻尼项 λI
+    % Δη = -(J^T*J + λI)^(-1) * (J^T*r)
+    % λ大时接近梯度下降(稳定但慢), λ小时接近N-G(快但可能不稳定)
+    
+    A = J' * J;                           % 近似Hessian矩阵
+    b = J' * r_vec;                       % 梯度向量
+    delta_eta = -(A + lambda * eye(5)) \ b;  % eye(5)=5×5单位矩阵
+    
+    % ===== 步骤7: 尝试更新 =====
+    alpha_new = alpha_lm + delta_eta(1);
+    beta_new = beta_lm + delta_eta(2);
+    p_new = p_lm + delta_eta(3:5);
+    
+    % --- 计算新参数下的误差 ---
+    Rx_new = [1,             0,                0;
+              0,  cosd(alpha_new), -sind(alpha_new);
+              0,  sind(alpha_new),  cosd(alpha_new)];
+    Ry_new = [cosd(beta_new),  0,  sind(beta_new);
+              0,               1,               0;
+             -sind(beta_new),  0,  cosd(beta_new)];
+    R_new = Ry_new * Rx_new;
+    
+    residuals_new = zeros(N_points, 3);
+    for i = 1:N_points
+        q_i = Q_model(i, :)';
+        p_i = P_measured(i, :)';
+        residuals_new(i, :) = (R_new' * (p_i - p_new) - q_i)';
+    end
+    e_new = sum(sum(residuals_new.^2));
+    
+    % ===== 步骤8: 自适应调整λ =====
+    if e_new < e_lm
+        % 更新成功! 误差下降了
+        % -> 接受新参数,减小λ(更接近N-G)
+        alpha_lm = alpha_new;
+        beta_lm = beta_new;
+        p_lm = p_new;
+        lambda = lambda / 10;  % λ缩小10倍
+    else
+        % 更新失败! 误差上升了
+        % -> 拒绝新参数,增大λ(更接近梯度下降)
+        lambda = lambda * 10;  % λ增大10倍
+        % 注意: 此时alpha_lm, beta_lm, p_lm保持不变
+    end
+end
+
+R_LM = R_new;
+p_LM = p_new;
+
+fprintf('\n【Levenberg-Marquardt法结果】\n');
+fprintf('  估计位姿:\n');
+fprintf('    α = %.6f° (真值: %.2f°)\n', alpha_lm, alpha_true);
+fprintf('    β = %.6f° (真值: %.2f°)\n', beta_lm, beta_true);
+fprintf('    p = [%.6f, %.6f, %.6f] mm\n', p_lm);
+fprintf('  误差:\n');
+fprintf('    Δα = %.6f°\n', abs(alpha_lm - alpha_true));
+fprintf('    Δβ = %.6f°\n', abs(beta_lm - beta_true));
+fprintf('    Δp = [%.6f, %.6f, %.6f] mm\n', abs(p_lm - p_true));
+fprintf('  准则函数: e(η) = %.6e\n', e_lm);
+fprintf('  RMSE = %.6f mm (%.2f μm)\n\n', ...
+    sqrt(e_lm/N_points), sqrt(e_lm/N_points)*1000);
+
+%% ========================================================================
+%% 第六部分: SVD闭式解 (对比方法)
+%% ========================================================================
+fprintf('========== 算法3: SVD闭式解 (Kabsch算法) ==========\n');
+
+% SVD方法不需要迭代,直接求解!
+% 基于已知点对对应关系 (Q_i ↔ P_i)
+
+% --- 步骤1: 去质心 ---
+centroid_P = mean(P_measured, 1)';  % 测量点质心 (3×1)
+centroid_Q = mean(Q_model, 1)';     % 模型点质心 (3×1)
+
+P_centered = P_measured - centroid_P';  % N×3, 每行减去质心
+Q_centered = Q_model - centroid_Q';
+
+% --- 步骤2: 构建协方差矩阵H ---
+H = Q_centered' * P_centered;  % 3×3矩阵
+
+% --- 步骤3: 奇异值分解 ---
+[U, ~, V] = svd(H);  % H = U * S * V^T
+
+% --- 步骤4: 计算旋转矩阵 ---
+R_SVD = V * U';
+
+% 检查是否为反射(det<0),若是则修正
+if det(R_SVD) < 0
+    V(:, 3) = -V(:, 3);  % 翻转第3列
+    R_SVD = V * U';
+end
+
+% --- 步骤5: 计算平移向量 ---
+p_SVD = centroid_Q - R_SVD * centroid_P;
+
+% --- 提取欧拉角 ---
+beta_svd = asind(-R_SVD(1,3));
+alpha_svd = atan2d(R_SVD(2,3), R_SVD(3,3));
+
+%% ========================================================================
+%% 第六部分: SVD闭式解 (对比方法) - 续
+%% ========================================================================
+
+fprintf('  估计位姿:\n');
+fprintf('    α = %.6f° (真值: %.2f°)\n', alpha_svd, alpha_true);
+fprintf('    β = %.6f° (真值: %.2f°)\n', beta_svd, beta_true);
+fprintf('    p = [%.6f, %.6f, %.6f] mm\n', p_SVD);
+fprintf('  误差:\n');
+fprintf('    Δα = %.6f°\n', abs(alpha_svd - alpha_true));
+fprintf('    Δβ = %.6f°\n', abs(beta_svd - beta_true));
+fprintf('    Δp = [%.6f, %.6f, %.6f] mm\n\n', abs(p_SVD - p_true));
+
+%% ========================================================================
+%% 第七部分: 可视化结果 (对应文档图2.7, 2.8)
+%% ========================================================================
+fprintf('========== 生成可视化图形 ==========\n');
+
+% 创建大窗口,分为2行4列共8个子图
+figure('Position', [50, 50, 1800, 900], 'Name', '非球面位姿求解仿真结果');
+
+% --- 子图1: 寻位前 (类似文档图2.7(a)) ---
+subplot(2,4,1);
+% 绘制模型点Q (蓝色圆圈)
+plot3(Q_model(:,1), Q_model(:,2), Q_model(:,3), ...
+      'bo', 'MarkerSize', 6, 'DisplayName', '模型点Q (C_M)');
+hold on;
+% 绘制测量点P (红色三角形)
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+      'r^', 'MarkerSize', 6, 'DisplayName', '测量点P (C_W)');
+xlabel('X (mm)', 'FontSize', 10);
+ylabel('Y (mm)', 'FontSize', 10);
+zlabel('Z (mm)', 'FontSize', 10);
+title('寻位前', 'FontSize', 12, 'FontWeight', 'bold');
+legend('Location', 'best');
+grid on;
+axis equal;  % 保持xyz比例相同
+view(45, 30);  % 设置视角 (方位角45°, 仰角30°)
+
+% --- 子图2: Newton-Gauss法寻位后 ---
+subplot(2,4,2);
+% 将模型点Q用N-G法估计的变换变换到机床坐标系
+Q_NG_transformed = (R_NG * Q_model')' + p_NG';
+plot3(Q_NG_transformed(:,1), Q_NG_transformed(:,2), Q_NG_transformed(:,3), ...
+      'go', 'MarkerSize', 6, 'DisplayName', '配准后Q');
+hold on;
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+      'r^', 'MarkerSize', 6, 'DisplayName', '测量点P');
+% 绘制匹配连线(显示残差)
+for i = 1:N_points
+    plot3([Q_NG_transformed(i,1), P_measured(i,1)], ...
+          [Q_NG_transformed(i,2), P_measured(i,2)], ...
+          [Q_NG_transformed(i,3), P_measured(i,3)], ...
+          'k--', 'LineWidth', 0.5);  % 黑色虚线
+end
+xlabel('X (mm)', 'FontSize', 10);
+ylabel('Y (mm)', 'FontSize', 10);
+zlabel('Z (mm)', 'FontSize', 10);
+title('N-G法寻位后', 'FontSize', 12, 'FontWeight', 'bold');
+legend('Location', 'best');
+grid on; axis equal; view(45, 30);
+
+% --- 子图3: LM法寻位后 ---
+subplot(2,4,3);
+Q_LM_transformed = (R_LM * Q_model')' + p_LM';
+plot3(Q_LM_transformed(:,1), Q_LM_transformed(:,2), Q_LM_transformed(:,3), ...
+      'mo', 'MarkerSize', 6, 'DisplayName', '配准后Q');
+hold on;
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+      'r^', 'MarkerSize', 6, 'DisplayName', '测量点P');
+for i = 1:N_points
+    plot3([Q_LM_transformed(i,1), P_measured(i,1)], ...
+          [Q_LM_transformed(i,2), P_measured(i,2)], ...
+          [Q_LM_transformed(i,3), P_measured(i,3)], ...
+          'k--', 'LineWidth', 0.5);
+end
+xlabel('X (mm)', 'FontSize', 10);
+ylabel('Y (mm)', 'FontSize', 10);
+zlabel('Z (mm)', 'FontSize', 10);
+title('LM法寻位后', 'FontSize', 12, 'FontWeight', 'bold');
+legend('Location', 'best');
+grid on; axis equal; view(45, 30);
+
+% --- 子图4: SVD法寻位后 ---
+subplot(2,4,4);
+Q_SVD_transformed = (R_SVD * Q_model')' + p_SVD';
+plot3(Q_SVD_transformed(:,1), Q_SVD_transformed(:,2), Q_SVD_transformed(:,3), ...
+      'co', 'MarkerSize', 6, 'DisplayName', '配准后Q');
+hold on;
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+      'r^', 'MarkerSize', 6, 'DisplayName', '测量点P');
+for i = 1:N_points
+    plot3([Q_SVD_transformed(i,1), P_measured(i,1)], ...
+          [Q_SVD_transformed(i,2), P_measured(i,2)], ...
+          [Q_SVD_transformed(i,3), P_measured(i,3)], ...
+          'k--', 'LineWidth', 0.5);
+end
+xlabel('X (mm)', 'FontSize', 10);
+ylabel('Y (mm)', 'FontSize', 10);
+zlabel('Z (mm)', 'FontSize', 10);
+title('SVD法寻位后', 'FontSize', 12, 'FontWeight', 'bold');
+legend('Location', 'best');
+grid on; axis equal; view(45, 30);
+
+% --- 子图5: Newton-Gauss收敛曲线 (对应文档图2.8) ---
+subplot(2,4,5);
+% semilogy: y轴采用对数刻度,适合显示快速下降的曲线
+semilogy(1:length(history_NG.error), history_NG.error, ...
+         'b-o', 'LineWidth', 1.5, 'MarkerSize', 5);
+xlabel('迭代次数', 'FontSize', 10);
+ylabel('准则函数 e(η) (对数刻度)', 'FontSize', 10);
+title('N-G法收敛曲线', 'FontSize', 12, 'FontWeight', 'bold');
+grid on;
+
+% --- 子图6: LM收敛曲线 ---
+subplot(2,4,6);
+semilogy(1:length(history_LM.error), history_LM.error, ...
+         'r-s', 'LineWidth', 1.5, 'MarkerSize', 5);
+xlabel('迭代次数', 'FontSize', 10);
+ylabel('准则函数 e(η) (对数刻度)', 'FontSize', 10);
+title('LM法收敛曲线', 'FontSize', 12, 'FontWeight', 'bold');
+grid on;
+
+% --- 子图7: LM阻尼因子变化 ---
+subplot(2,4,7);
+% 显示λ如何自适应调整
+semilogy(1:length(history_LM.lambda), history_LM.lambda, ...
+         'm-d', 'LineWidth', 1.5, 'MarkerSize', 5);
+xlabel('迭代次数', 'FontSize', 10);
+ylabel('阻尼因子 λ (对数刻度)', 'FontSize', 10);
+title('LM法阻尼因子自适应', 'FontSize', 12, 'FontWeight', 'bold');
+grid on;
+% 物理意义: λ↑表示接近梯度下降(稳定但慢)
+%          λ↓表示接近N-G(快但可能震荡)
+
+% --- 子图8: 三种方法精度对比 ---
+subplot(2,4,8);
+% 计算各方法的RMSE (单位:微米)
+residuals_NG = vecnorm(Q_NG_transformed - P_measured, 2, 2);
+residuals_LM = vecnorm(Q_LM_transformed - P_measured, 2, 2);
+residuals_SVD = vecnorm(Q_SVD_transformed - P_measured, 2, 2);
+
+rmse_values = [
+    sqrt(mean(residuals_NG.^2)) * 1000,  % N-G的RMSE (μm)
+    sqrt(mean(residuals_LM.^2)) * 1000,  % LM的RMSE
+    sqrt(mean(residuals_SVD.^2)) * 1000  % SVD的RMSE
+];
+
+% 绘制柱状图
+bar_handle = bar(rmse_values, 'FaceColor', 'flat');
+% 设置不同颜色
+bar_handle.CData(1,:) = [0 0 1];    % 蓝色
+bar_handle.CData(2,:) = [1 0 0];    % 红色
+bar_handle.CData(3,:) = [0 1 1];    % 青色
+
+set(gca, 'XTickLabel', {'N-G法', 'LM法', 'SVD法'});
+ylabel('RMSE (μm)', 'FontSize', 10);
+title('算法精度对比', 'FontSize', 12, 'FontWeight', 'bold');
+grid on;
+
+% 在柱子上方标注数值
+for i = 1:3
+    text(i, rmse_values(i)+0.5, sprintf('%.2f', rmse_values(i)), ...
+         'HorizontalAlignment', 'center', 'FontSize', 9);
+end
+
+%% ========================================================================
+%% 第八部分: 结果总结
+%% ========================================================================
+fprintf('\n========== 仿真结果总结 ==========\n');
+fprintf('【算法性能对比】\n');
+fprintf('  %-10s | 迭代次数 | α误差(°) | β误差(°) | RMSE(μm)\n', '算法');
+fprintf('  ----------------------------------------------------------\n');
+fprintf('  %-10s | %8d | %.6f | %.6f | %7.2f\n', ...
+    'N-G法', length(history_NG.error), ...
+    abs(history_NG.alpha(end) - alpha_true), ...
+    abs(history_NG.beta(end) - beta_true), ...
+    rmse_values(1));
+fprintf('  %-10s | %8d | %.6f | %.6f | %7.2f\n', ...
+    'LM法', length(history_LM.error), ...
+    abs(history_LM.alpha(end) - alpha_true), ...
+    abs(history_LM.beta(end) - beta_true), ...
+    rmse_values(2));
+fprintf('  %-10s | %8s | %.6f | %.6f | %7.2f\n', ...
+    'SVD法', '直接解', ...
+    abs(alpha_svd - alpha_true), ...
+    abs(beta_svd - beta_true), ...
+    rmse_values(3));
+
+fprintf('\n【算法特点】\n');
+fprintf('  • Newton-Gauss法: 二阶收敛,局部最优,需要好的初值\n');
+fprintf('  • LM法: 自适应阻尼,鲁棒性强,适合病态问题\n');
+fprintf('  • SVD法: 闭式解,无需迭代,但要求点对已知\n');
+
+fprintf('\n仿真完成!\n');
+
+%% ========================================================================
+%% 附录: 关键概念解释
+%% ========================================================================
+% 
+% 【SE(3)群】
+%   - 特殊欧氏群,描述3D空间的刚体运动
+%   - 元素: 4×4齐次变换矩阵 g = [R, p; 0, 1]
+%   - R: 3×3旋转矩阵 (SO(3)群,满足R^T*R=I, det(R)=1)
+%   - p: 3×1平移向量
+%
+% 【准则函数 e(η)】
+%   - 物理意义: 所有测点变换后与模型点偏差的平方和
+%   - 目标: 最小化 e(η) = Σ||R^T*(p_i - p) - q_i||²
+%   - 单位: mm² (长度平方)
+%
+% 【Jacobian矩阵 J】
+%   - 尺寸: (3N)×5
+%   - 物理意义: 残差向量对参数的偏导数
+%   - 作用: 线性化非线性优化问题
+%
+% 【Newton-Gauss vs LM】
+%   - N-G: Δη = -(J^T*J)^(-1) * (J^T*r)
+%   - LM:  Δη = -(J^T*J + λI)^(-1) * (J^T*r)
+%   - 区别: LM加入阻尼项λI,防止震荡和发散
+%
+% 【SVD算法 (Kabsch)】
+%   - 输入: 两组对应点集 {q_i} ↔ {p_i}
+%   - 步骤: 去质心 → 构建H → SVD分解 → R=V*U^T
+%   - 优点: 全局最优,一步到位
+%   - 缺点: 需要已知点对对应关系
+%
+% 【收敛性分析】
+%   - N-G: 二阶收敛(误差平方级减小),但初值敏感
+%   - LM: 一阶到二阶收敛(自适应),初值鲁棒
+%   - 判据: e(η) < 10^(-6) 或 ||Δη|| < 10^(-6)
+%
+
+%% ========================================================================
+%% 非球面工件位姿求解 - 详细注释版 (适合新手学习)
+%% 实现文档2.3节迭代优化 + 2.4节仿真验证
+%% ========================================================================
+clear;      % 清除工作区所有变量
+clc;        % 清空命令行窗口
+close all;  % 关闭所有图形窗口
+
+%% ========================================================================
+%% 第一部分: 参数设置 (对应文档2.4.1节 表2.2)
+%% ========================================================================
+fprintf('========== 开始仿真 ==========\n\n');
+
+% --- 非球面几何参数 ---
+% 非球面方程: z = (c*ρ²)/(1+√(1-(1+K)c²ρ²)) + A4*ρ⁴ + A6*ρ⁶
+% 其中: c=1/R (曲率), ρ=√(x²+y²) (径向距离)
+
+R = 1000;              % 顶点曲率半径 (mm) - 控制曲面弯曲程度
+                       % R越大,曲面越平缓
+                       
+K = -2;                % 二次常数 (圆锥系数)
+                       % K=-1: 抛物面
+                       % K<-1: 双曲面 (本例)
+                       % K>0:  扁椭球
+                       
+A4 = 0;                % 4阶非球面系数 (控制高阶偏离)
+A6 = 0;                % 6阶非球面系数
+aperture_size = 300;   % 非球面口径 (mm) - 300×300mm方形口径
+
+% --- 真实位姿参数 (文档表2.3) ---
+% 这是"真实"的工件放置姿态,仿真时已知,实际测量时未知
+alpha_true = 2;        % 绕X轴倾斜角度 (度) - 俯仰角
+beta_true = 1.5;       % 绕Y轴倾斜角度 (度) - 偏航角
+px_true = 10;          % X方向平移 (mm)
+py_true = -8;          % Y方向平移 (mm)
+pz_true = 10;          % Z方向平移 (mm)
+
+% --- 测量误差参数 ---
+sigma_noise = 0.01;    % 测量标准差 (mm) - 模拟测头10微米误差
+
+% 输出设置信息
+fprintf('【仿真参数】\n');
+fprintf('  非球面: R=%d mm, K=%.1f\n', R, K);
+fprintf('  口径: %d×%d mm\n', aperture_size, aperture_size);
+fprintf('  真实位姿: α=%.1f°, β=%.1f°\n', alpha_true, beta_true);
+fprintf('           平移=[%.1f, %.1f, %.1f] mm\n', px_true, py_true, pz_true);
+fprintf('  测量误差: σ=%.2f mm (%.0f μm)\n\n', sigma_noise, sigma_noise*1000);
+
+%% ========================================================================
+%% 第二部分: 生成测量点 (对应文档2.4.2节)
+%% ========================================================================
+
+% --- 2.1 选择采样方案 ---
+% 定义三种测点分布方案
+sampling_schemes = {
+    struct('name', '3×3网格(9点)',  'grid', 3),   % 稀疏采样
+    struct('name', '5×5网格(25点)', 'grid', 5),   % 中等采样(推荐)
+    struct('name', '7×7网格(49点)', 'grid', 7)    % 密集采样
+};
+
+scheme_idx = 2;  % 选择第2种方案 (可改为1或3试验不同效果)
+scheme = sampling_schemes{scheme_idx};
+grid_size = scheme.grid;  % 网格大小: 5×5
+
+fprintf('【测点分布】\n');
+fprintf('  方案: %s\n', scheme.name);
+
+% --- 2.2 生成均匀网格坐标 ---
+% linspace(起点, 终点, 点数) - 生成等间距数组
+x_range = linspace(-aperture_size/2, aperture_size/2, grid_size);
+y_range = linspace(-aperture_size/2, aperture_size/2, grid_size);
+
+% meshgrid - 将1D数组扩展为2D网格
+% 例如: x_range=[-150, -75, 0, 75, 150]
+%       生成5×5网格,X_grid的每一行都是[-150,-75,0,75,150]
+[X_grid, Y_grid] = meshgrid(x_range, y_range);
+
+% --- 2.3 计算非球面Z坐标 (式2.27) ---
+% 对网格上每个点(x,y)计算对应的z值
+Z_grid = zeros(size(X_grid));  % 预分配内存
+
+for i = 1:size(X_grid, 1)      % 遍历每一行
+    for j = 1:size(X_grid, 2)  % 遍历每一列
+        x = X_grid(i, j);
+        y = Y_grid(i, j);
+        
+        % 计算径向距离
+        rho = sqrt(x^2 + y^2);
+        
+        % 非球面公式 (式2.27)
+        c = 1 / R;  % 曲率
+        discriminant = 1 - (1 + K) * c^2 * rho^2;  % 判别式
+        
+        if discriminant >= 0  % 确保根号内非负
+            Z_grid(i, j) = (c * rho^2) / (1 + sqrt(discriminant)) + ...
+                           A4 * rho^4 + A6 * rho^6;
+        else
+            Z_grid(i, j) = NaN;  % 无效点标记为NaN
+        end
+    end
+end
+
+% --- 2.4 应用圆形口径掩膜 ---
+% 只保留口径内的点 (√(x²+y²) ≤ aperture_size/2)
+R_grid = sqrt(X_grid.^2 + Y_grid.^2);  % 每个点到中心的距离
+mask = R_grid <= aperture_size/2;       % 布尔矩阵: 1=有效, 0=超出口径
+
+% --- 2.5 提取有效测点为N×3矩阵 ---
+% 这是理想的模型点集Q (在工件坐标系C_M下)
+Q_model = [X_grid(mask), Y_grid(mask), Z_grid(mask)];
+N_points = size(Q_model, 1);  % 测点总数
+
+fprintf('  有效测点数: N=%d\n\n', N_points);
+
+%% ========================================================================
+%% 第三部分: 模拟真实测量 (生成机床坐标系C_W下的测量点P)
+%% ========================================================================
+fprintf('【生成测量数据】\n');
+
+% --- 3.1 构建真实旋转矩阵 R_true ---
+% 绕X轴旋转矩阵 (俯仰)
+Rx_true = [1,              0,                 0;
+           0,  cosd(alpha_true), -sind(alpha_true);
+           0,  sind(alpha_true),  cosd(alpha_true)];
+
+% 绕Y轴旋转矩阵 (偏航)       
+Ry_true = [cosd(beta_true),  0,  sind(beta_true);
+           0,                1,                 0;
+          -sind(beta_true),  0,  cosd(beta_true)];
+
+% 复合旋转 (先绕X再绕Y)
+R_true = Ry_true * Rx_true;
+
+% 平移向量
+p_true = [px_true; py_true; pz_true];  % 3×1列向量
+
+% --- 3.2 坐标变换 (式2.8) ---
+% 将工件坐标系C_M下的模型点Q变换到机床坐标系C_W
+% P = R * Q' + p  (注意: Q'表示Q的转置,因为Q是N×3,需要转为3×N)
+P_ideal = (R_true * Q_model')' + p_true';  % 理想测量点 (无噪声)
+
+% --- 3.3 添加测量噪声 (式2.31) ---
+% randn生成标准正态分布随机数,乘以sigma得到N(0,σ²)噪声
+measurement_noise = sigma_noise * randn(size(P_ideal));
+P_measured = P_ideal + measurement_noise;  % 实际测量点 (有噪声)
+
+fprintf('  测量点生成完成 (已添加%.0f μm噪声)\n\n', sigma_noise*1000);
+
+%% ========================================================================
+%% 第四部分: Newton-Gauss迭代法求解 (文档2.3.1节)
+%% ========================================================================
+fprintf('========== 算法1: Newton-Gauss迭代法 ==========\n');
+
+% --- 4.1 初始猜测值 (式2.18) ---
+% 实际中通常从零位姿开始迭代
+alpha_0 = 0;     % 初始倾斜角 (度)
+beta_0 = 0;
+p_0 = [0; 0; 0]; % 初始平移 (mm)
+
+% --- 4.2 迭代控制参数 ---
+max_iter = 50;         % 最大迭代次数
+tolerance = 1e-6;      % 收敛判据: 当e(η)<tolerance时停止
+
+% --- 4.3 记录迭代历史 (用于绘图) ---
+history_NG = struct();  % 创建空结构体
+history_NG.alpha = [];  % 每次迭代的α值
+history_NG.beta = [];   % 每次迭代的β值
+history_NG.px = [];     % 每次迭代的px值
+history_NG.py = [];
+history_NG.pz = [];
+history_NG.error = [];  % 每次迭代的准则函数值
+
+% --- 4.4 初始化当前估计值 ---
+alpha_k = alpha_0;  % k代表第k次迭代
+beta_k = beta_0;
+p_k = p_0;
+
+% 输出表头
+fprintf('初值: α=%.2f°, β=%.2f°, p=[%.1f,%.1f,%.1f]mm\n', ...
+    alpha_0, beta_0, p_0);
+fprintf('收敛条件: e(η) < %.2e\n\n', tolerance);
+fprintf('Iter\t α(°)\t\t β(°)\t\t ||p||(mm)\t e(η)\n');
+fprintf('------------------------------------------------------------\n');
+
+% --- 4.5 开始迭代 ---
+for iter = 1:max_iter
+    
+    % ===== 步骤1: 构建当前旋转矩阵 R_k =====
+    Rx_k = [1,            0,               0;
+            0,  cosd(alpha_k), -sind(alpha_k);
+            0,  sind(alpha_k),  cosd(alpha_k)];
+        
+    Ry_k = [cosd(beta_k),  0,  sind(beta_k);
+            0,             1,              0;
+           -sind(beta_k),  0,  cosd(beta_k)];
+    
+    R_k = Ry_k * Rx_k;  % 当前估计的旋转矩阵
+    
+    % ===== 步骤2: 计算残差向量 r_i (式2.17) =====
+    % r_i = R_k^T * (p_i - p_k) - q_i
+    % 物理意义: 将测量点p_i变换回工件坐标系,与模型点q_i的偏差
+    residuals = zeros(N_points, 3);  % 预分配N×3矩阵
+    
+    for i = 1:N_points
+        q_i = Q_model(i, :)';       % 模型点 (3×1列向量)
+        p_i = P_measured(i, :)';    % 测量点 (3×1列向量)
+        
+        % 计算残差 (向量形式)
+        r_i = R_k' * (p_i - p_k) - q_i;
+        residuals(i, :) = r_i';     % 存储为行向量
+    end
+    
+    % ===== 步骤3: 计算准则函数 e(η) =====
+    % e(η) = Σ ||r_i||² (所有残差的平方和)
+    e_k = sum(sum(residuals.^2));  % 双重sum: 先对列求和,再对行求和
+    
+    % ===== 步骤4: 记录本次迭代结果 =====
+    history_NG.alpha(iter) = alpha_k;
+    history_NG.beta(iter) = beta_k;
+    history_NG.px(iter) = p_k(1);
+    history_NG.py(iter) = p_k(2);
+    history_NG.pz(iter) = p_k(3);
+    history_NG.error(iter) = e_k;
+    
+    % 输出当前状态
+    fprintf('%2d\t %.6f\t %.6f\t %.6f\t %.6e\n', ...
+        iter, alpha_k, beta_k, norm(p_k), e_k);
+    
+    % ===== 步骤5: 判断收敛 =====
+    if e_k < tolerance
+        fprintf('\n✓ 收敛! 经过%d次迭代达到精度要求\n', iter);
+        break;  % 跳出循环
+    end
+    
+    % ===== 步骤6: 构建Jacobian矩阵 J (式2.23) =====
+    % J是 (3N)×5 矩阵,对应5个未知数: [Δα, Δβ, Δpx, Δpy, Δpz]
+    % 每个测点贡献3行 (对应x,y,z方向的残差)
+    
+    J = zeros(3*N_points, 5);  % 预分配Jacobian矩阵
+    r_vec = reshape(residuals', [], 1);  % 将N×3展平为(3N)×1列向量
+    
+    for i = 1:N_points
+        q_i = Q_model(i, :)';
+        p_i = P_measured(i, :)';
+        
+        % --- 计算 ∂r/∂α (对α的偏导数) ---
+        % 需要先计算 ∂R/∂α
+        dRx_dalpha = [0,             0,               0;
+                      0, -sind(alpha_k), -cosd(alpha_k);
+                      0,  cosd(alpha_k), -sind(alpha_k)] * (pi/180);  % 度转弧度
+        
+        dR_dalpha = Ry_k * dRx_dalpha;  % 链式法则
+        
+        % --- 计算 ∂r/∂β ---
+        dRy_dbeta = [-sind(beta_k),  0,  cosd(beta_k);
+                                  0,  0,              0;
+                     -cosd(beta_k),  0, -sind(beta_k)] * (pi/180);
+        
+        dR_dbeta = dRy_dbeta * Rx_k;
+        
+        % --- 填充Jacobian矩阵 ---
+        row_idx = (i-1)*3 + 1;  % 当前测点对应的起始行索引
+        
+        % 第1列: ∂r/∂α
+        J(row_idx:row_idx+2, 1) = dR_dalpha' * (p_i - p_k);
+        
+        % 第2列: ∂r/∂β
+        J(row_idx:row_idx+2, 2) = dR_dbeta' * (p_i - p_k);
+        
+        % 第3-5列: ∂r/∂p = -R_k^T
+        J(row_idx:row_idx+2, 3:5) = -R_k';
+    end
+    
+    % ===== 步骤7: Newton-Gauss更新 (式2.24) =====
+    % Δη = -(J^T * J)^(-1) * (J^T * r)
+    % 这是最小二乘法的标准形式
+    
+    delta_eta = -(J' * J) \ (J' * r_vec);  % \表示左除(求解线性方程组)
+    
+    % ===== 步骤8: 更新参数 =====
+    alpha_k = alpha_k + delta_eta(1);  % 新α = 旧α + Δα
+    beta_k = beta_k + delta_eta(2);
+    p_k = p_k + delta_eta(3:5);        % 向量加法
+    
+    % 防止超过最大迭代次数
+    if iter == max_iter
+        fprintf('\n⚠ 警告: 达到最大迭代次数(%d)未收敛!\n', max_iter);
+    end
+end
+
+% --- 4.6 保存最终结果 ---
+R_NG = Ry_k * Rx_k;  % 最终旋转矩阵
+p_NG = p_k;          % 最终平移向量
+
+% --- 4.7 输出结果分析 ---
+fprintf('\n【Newton-Gauss法结果】\n');
+fprintf('  估计位姿:\n');
+fprintf('    α = %.6f° (真值: %.2f°)\n', alpha_k, alpha_true);
+fprintf('    β = %.6f° (真值: %.2f°)\n', beta_k, beta_true);
+fprintf('    p = [%.6f, %.6f, %.6f] mm\n', p_k);
+fprintf('  误差:\n');
+fprintf('    Δα = %.6f° (%.3f 角秒)\n', ...
+    abs(alpha_k - alpha_true), abs(alpha_k - alpha_true)*3600);
+fprintf('    Δβ = %.6f° (%.3f 角秒)\n', ...
+    abs(beta_k - beta_true), abs(beta_k - beta_true)*3600);
+fprintf('    Δp = [%.6f, %.6f, %.6f] mm\n', abs(p_k - p_true));
+fprintf('  准则函数: e(η) = %.6e\n', e_k);
+fprintf('  RMSE = %.6f mm (%.2f μm)\n\n', ...
+    sqrt(e_k/N_points), sqrt(e_k/N_points)*1000);
+
+%% ========================================================================
+%% 第五部分: Levenberg-Marquardt迭代法 (文档2.3.2节)
+%% ========================================================================
+fprintf('========== 算法2: Levenberg-Marquardt法 ==========\n');
+
+% --- 5.1 初始化 ---
+alpha_lm = alpha_0;  % 同样从零位姿开始
+beta_lm = beta_0;
+p_lm = p_0;
+lambda = 0.01;       % 阻尼因子初值 (式2.26)
+
+history_LM = struct();
+history_LM.alpha = [];
+history_LM.beta = [];
+history_LM.px = [];
+history_LM.py = [];
+history_LM.pz = [];
+history_LM.error = [];
+history_LM.lambda = [];  % 记录阻尼因子变化
+
+fprintf('初始阻尼因子: λ=%.4f\n\n', lambda);
+fprintf('Iter\t α(°)\t\t β(°)\t\t ||p||(mm)\t e(η)\t\t λ\n');
+fprintf('------------------------------------------------------------------------\n');
+
+% --- 5.2 LM迭代 ---
+for iter = 1:max_iter
+    
+    % ===== 步骤1-4: 同Newton-Gauss =====
+    Rx_lm = [1,             0,                0;
+             0,  cosd(alpha_lm), -sind(alpha_lm);
+             0,  sind(alpha_lm),  cosd(alpha_lm)];
+         
+    Ry_lm = [cosd(beta_lm),  0,  sind(beta_lm);
+             0,              1,               0;
+            -sind(beta_lm),  0,  cosd(beta_lm)];
+    
+    R_lm = Ry_lm * Rx_lm;
+    
+    % 计算残差
+    residuals = zeros(N_points, 3);
+    for i = 1:N_points
+        q_i = Q_model(i, :)';
+        p_i = P_measured(i, :)';
+        residuals(i, :) = (R_lm' * (p_i - p_lm) - q_i)';
+    end
+    
+    e_lm = sum(sum(residuals.^2));
+    
+    % 记录历史
+    history_LM.alpha(iter) = alpha_lm;
+    history_LM.beta(iter) = beta_lm;
+    history_LM.px(iter) = p_lm(1);
+    history_LM.py(iter) = p_lm(2);
+    history_LM.pz(iter) = p_lm(3);
+    history_LM.error(iter) = e_lm;
+    history_LM.lambda(iter) = lambda;
+    
+    fprintf('%2d\t %.6f\t %.6f\t %.6f\t %.6e\t %.4f\n', ...
+        iter, alpha_lm, beta_lm, norm(p_lm), e_lm, lambda);
+    
+    if e_lm < tolerance
+        fprintf('\n✓ 收敛! 经过%d次迭代达到精度要求\n', iter);
+        break;
+    end
+    
+    % ===== 步骤5: 构建Jacobian (同N-G) =====
+    J = zeros(3*N_points, 5);
+    r_vec = reshape(residuals', [], 1);
+    
+    for i = 1:N_points
+        q_i = Q_model(i, :)';
+        p_i = P_measured(i, :)';
+        
+        dRx_dalpha = [0,              0,                0;
+                      0, -sind(alpha_lm), -cosd(alpha_lm);
+                      0,  cosd(alpha_lm), -sind(alpha_lm)] * (pi/180);
+        dR_dalpha = Ry_lm * dRx_dalpha;
+        
+        dRy_dbeta = [-sind(beta_lm),  0,  cosd(beta_lm);
+                                   0,  0,              0;
+                     -cosd(beta_lm),  0, -sind(beta_lm)] * (pi/180);
+        dR_dbeta = dRy_dbeta * Rx_lm;
+        
+        row_idx = (i-1)*3 + 1;
+        J(row_idx:row_idx+2, 1) = dR_dalpha' * (p_i - p_lm);
+        J(row_idx:row_idx+2, 2) = dR_dbeta' * (p_i - p_lm);
+        J(row_idx:row_idx+2, 3:5) = -R_lm';
+    end
+    
+    % ===== 步骤6: LM更新 (式2.26) =====
+    % 【关键区别】加入阻尼项 λI
+    % Δη = -(J^T*J + λI)^(-1) * (J^T*r)
+    % λ大时接近梯度下降(稳定但慢), λ小时接近N-G(快但可能不稳定)
+    
+    A = J' * J;                           % 近似Hessian矩阵
+    b = J' * r_vec;                       % 梯度向量
+    delta_eta = -(A + lambda * eye(5)) \ b;  % eye(5)=5×5单位矩阵
+    
+    % ===== 步骤7: 尝试更新 =====
+    alpha_new = alpha_lm + delta_eta(1);
+    beta_new = beta_lm + delta_eta(2);
+    p_new = p_lm + delta_eta(3:5);
+    
+    % --- 计算新参数下的误差 ---
+    Rx_new = [1,             0,                0;
+              0,  cosd(alpha_new), -sind(alpha_new);
+              0,  sind(alpha_new),  cosd(alpha_new)];
+    Ry_new = [cosd(beta_new),  0,  sind(beta_new);
+              0,               1,               0;
+             -sind(beta_new),  0,  cosd(beta_new)];
+    R_new = Ry_new * Rx_new;
+    
+    residuals_new = zeros(N_points, 3);
+    for i = 1:N_points
+        q_i = Q_model(i, :)';
+        p_i = P_measured(i, :)';
+        residuals_new(i, :) = (R_new' * (p_i - p_new) - q_i)';
+    end
+    e_new = sum(sum(residuals_new.^2));
+    
+    % ===== 步骤8: 自适应调整λ =====
+    if e_new < e_lm
+        % 更新成功! 误差下降了
+        % -> 接受新参数,减小λ(更接近N-G)
+        alpha_lm = alpha_new;
+        beta_lm = beta_new;
+        p_lm = p_new;
+        lambda = lambda / 10;  % λ缩小10倍
+    else
+        % 更新失败! 误差上升了
+        % -> 拒绝新参数,增大λ(更接近梯度下降)
+        lambda = lambda * 10;  % λ增大10倍
+        % 注意: 此时alpha_lm, beta_lm, p_lm保持不变
+    end
+end
+
+R_LM = R_new;
+p_LM = p_new;
+
+fprintf('\n【Levenberg-Marquardt法结果】\n');
+fprintf('  估计位姿:\n');
+fprintf('    α = %.6f° (真值: %.2f°)\n', alpha_lm, alpha_true);
+fprintf('    β = %.6f° (真值: %.2f°)\n', beta_lm, beta_true);
+fprintf('    p = [%.6f, %.6f, %.6f] mm\n', p_lm);
+fprintf('  误差:\n');
+fprintf('    Δα = %.6f°\n', abs(alpha_lm - alpha_true));
+fprintf('    Δβ = %.6f°\n', abs(beta_lm - beta_true));
+fprintf('    Δp = [%.6f, %.6f, %.6f] mm\n', abs(p_lm - p_true));
+fprintf('  准则函数: e(η) = %.6e\n', e_lm);
+fprintf('  RMSE = %.6f mm (%.2f μm)\n\n', ...
+    sqrt(e_lm/N_points), sqrt(e_lm/N_points)*1000);
+
+%% ========================================================================
+%% 第六部分: SVD闭式解 (对比方法)
+%% ========================================================================
+fprintf('========== 算法3: SVD闭式解 (Kabsch算法) ==========\n');
+
+% SVD方法不需要迭代,直接求解!
+% 基于已知点对对应关系 (Q_i ↔ P_i)
+
+% --- 步骤1: 去质心 ---
+centroid_P = mean(P_measured, 1)';  % 测量点质心 (3×1)
+centroid_Q = mean(Q_model, 1)';     % 模型点质心 (3×1)
+
+P_centered = P_measured - centroid_P';  % N×3, 每行减去质心
+Q_centered = Q_model - centroid_Q';
+
+% --- 步骤2: 构建协方差矩阵H ---
+H = Q_centered' * P_centered;  % 3×3矩阵
+
+% --- 步骤3: 奇异值分解 ---
+[U, ~, V] = svd(H);  % H = U * S * V^T
+
+% --- 步骤4: 计算旋转矩阵 ---
+R_SVD = V * U';
+
+% 检查是否为反射(det<0),若是则修正
+if det(R_SVD) < 0
+    V(:, 3) = -V(:, 3);  % 翻转第3列
+    R_SVD = V * U';
+end
+
+% --- 步骤5: 计算平移向量 ---
+p_SVD = centroid_Q - R_SVD * centroid_P;
+
+% --- 提取欧拉角 ---
+beta_svd = asind(-R_SVD(1,3));
+alpha_svd = atan2d(R_SVD(2,3), R_SVD(3,3));
+
+%% ========================================================================
+%% 第六部分: SVD闭式解 (对比方法) - 续
+%% ========================================================================
+
+fprintf('  估计位姿:\n');
+fprintf('    α = %.6f° (真值: %.2f°)\n', alpha_svd, alpha_true);
+fprintf('    β = %.6f° (真值: %.2f°)\n', beta_svd, beta_true);
+fprintf('    p = [%.6f, %.6f, %.6f] mm\n', p_SVD);
+fprintf('  误差:\n');
+fprintf('    Δα = %.6f°\n', abs(alpha_svd - alpha_true));
+fprintf('    Δβ = %.6f°\n', abs(beta_svd - beta_true));
+fprintf('    Δp = [%.6f, %.6f, %.6f] mm\n\n', abs(p_SVD - p_true));
+
+%% ========================================================================
+%% 第七部分: 可视化结果 (对应文档图2.7, 2.8)
+%% ========================================================================
+fprintf('========== 生成可视化图形 ==========\n');
+
+% 创建大窗口,分为2行4列共8个子图
+figure('Position', [50, 50, 1800, 900], 'Name', '非球面位姿求解仿真结果');
+
+% --- 子图1: 寻位前 (类似文档图2.7(a)) ---
+subplot(2,4,1);
+% 绘制模型点Q (蓝色圆圈)
+plot3(Q_model(:,1), Q_model(:,2), Q_model(:,3), ...
+      'bo', 'MarkerSize', 6, 'DisplayName', '模型点Q (C_M)');
+hold on;
+% 绘制测量点P (红色三角形)
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+      'r^', 'MarkerSize', 6, 'DisplayName', '测量点P (C_W)');
+xlabel('X (mm)', 'FontSize', 10);
+ylabel('Y (mm)', 'FontSize', 10);
+zlabel('Z (mm)', 'FontSize', 10);
+title('寻位前', 'FontSize', 12, 'FontWeight', 'bold');
+legend('Location', 'best');
+grid on;
+axis equal;  % 保持xyz比例相同
+view(45, 30);  % 设置视角 (方位角45°, 仰角30°)
+
+% --- 子图2: Newton-Gauss法寻位后 ---
+subplot(2,4,2);
+% 将模型点Q用N-G法估计的变换变换到机床坐标系
+Q_NG_transformed = (R_NG * Q_model')' + p_NG';
+plot3(Q_NG_transformed(:,1), Q_NG_transformed(:,2), Q_NG_transformed(:,3), ...
+      'go', 'MarkerSize', 6, 'DisplayName', '配准后Q');
+hold on;
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+      'r^', 'MarkerSize', 6, 'DisplayName', '测量点P');
+% 绘制匹配连线(显示残差)
+for i = 1:N_points
+    plot3([Q_NG_transformed(i,1), P_measured(i,1)], ...
+          [Q_NG_transformed(i,2), P_measured(i,2)], ...
+          [Q_NG_transformed(i,3), P_measured(i,3)], ...
+          'k--', 'LineWidth', 0.5);  % 黑色虚线
+end
+xlabel('X (mm)', 'FontSize', 10);
+ylabel('Y (mm)', 'FontSize', 10);
+zlabel('Z (mm)', 'FontSize', 10);
+title('N-G法寻位后', 'FontSize', 12, 'FontWeight', 'bold');
+legend('Location', 'best');
+grid on; axis equal; view(45, 30);
+
+% --- 子图3: LM法寻位后 ---
+subplot(2,4,3);
+Q_LM_transformed = (R_LM * Q_model')' + p_LM';
+plot3(Q_LM_transformed(:,1), Q_LM_transformed(:,2), Q_LM_transformed(:,3), ...
+      'mo', 'MarkerSize', 6, 'DisplayName', '配准后Q');
+hold on;
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+      'r^', 'MarkerSize', 6, 'DisplayName', '测量点P');
+for i = 1:N_points
+    plot3([Q_LM_transformed(i,1), P_measured(i,1)], ...
+          [Q_LM_transformed(i,2), P_measured(i,2)], ...
+          [Q_LM_transformed(i,3), P_measured(i,3)], ...
+          'k--', 'LineWidth', 0.5);
+end
+xlabel('X (mm)', 'FontSize', 10);
+ylabel('Y (mm)', 'FontSize', 10);
+zlabel('Z (mm)', 'FontSize', 10);
+title('LM法寻位后', 'FontSize', 12, 'FontWeight', 'bold');
+legend('Location', 'best');
+grid on; axis equal; view(45, 30);
+
+% --- 子图4: SVD法寻位后 ---
+subplot(2,4,4);
+Q_SVD_transformed = (R_SVD * Q_model')' + p_SVD';
+plot3(Q_SVD_transformed(:,1), Q_SVD_transformed(:,2), Q_SVD_transformed(:,3), ...
+      'co', 'MarkerSize', 6, 'DisplayName', '配准后Q');
+hold on;
+plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), ...
+      'r^', 'MarkerSize', 6, 'DisplayName', '测量点P');
+for i = 1:N_points
+    plot3([Q_SVD_transformed(i,1), P_measured(i,1)], ...
+          [Q_SVD_transformed(i,2), P_measured(i,2)], ...
+          [Q_SVD_transformed(i,3), P_measured(i,3)], ...
+          'k--', 'LineWidth', 0.5);
+end
+xlabel('X (mm)', 'FontSize', 10);
+ylabel('Y (mm)', 'FontSize', 10);
+zlabel('Z (mm)', 'FontSize', 10);
+title('SVD法寻位后', 'FontSize', 12, 'FontWeight', 'bold');
+legend('Location', 'best');
+grid on; axis equal; view(45, 30);
+
+% --- 子图5: Newton-Gauss收敛曲线 (对应文档图2.8) ---
+subplot(2,4,5);
+% semilogy: y轴采用对数刻度,适合显示快速下降的曲线
+semilogy(1:length(history_NG.error), history_NG.error, ...
+         'b-o', 'LineWidth', 1.5, 'MarkerSize', 5);
+xlabel('迭代次数', 'FontSize', 10);
+ylabel('准则函数 e(η) (对数刻度)', 'FontSize', 10);
+title('N-G法收敛曲线', 'FontSize', 12, 'FontWeight', 'bold');
+grid on;
+
+% --- 子图6: LM收敛曲线 ---
+subplot(2,4,6);
+semilogy(1:length(history_LM.error), history_LM.error, ...
+         'r-s', 'LineWidth', 1.5, 'MarkerSize', 5);
+xlabel('迭代次数', 'FontSize', 10);
+ylabel('准则函数 e(η) (对数刻度)', 'FontSize', 10);
+title('LM法收敛曲线', 'FontSize', 12, 'FontWeight', 'bold');
+grid on;
+
+% --- 子图7: LM阻尼因子变化 ---
+subplot(2,4,7);
+% 显示λ如何自适应调整
+semilogy(1:length(history_LM.lambda), history_LM.lambda, ...
+         'm-d', 'LineWidth', 1.5, 'MarkerSize', 5);
+xlabel('迭代次数', 'FontSize', 10);
+ylabel('阻尼因子 λ (对数刻度)', 'FontSize', 10);
+title('LM法阻尼因子自适应', 'FontSize', 12, 'FontWeight', 'bold');
+grid on;
+% 物理意义: λ↑表示接近梯度下降(稳定但慢)
+%          λ↓表示接近N-G(快但可能震荡)
+
+% --- 子图8: 三种方法精度对比 ---
+subplot(2,4,8);
+% 计算各方法的RMSE (单位:微米)
+residuals_NG = vecnorm(Q_NG_transformed - P_measured, 2, 2);
+residuals_LM = vecnorm(Q_LM_transformed - P_measured, 2, 2);
+residuals_SVD = vecnorm(Q_SVD_transformed - P_measured, 2, 2);
+
+rmse_values = [
+    sqrt(mean(residuals_NG.^2)) * 1000,  % N-G的RMSE (μm)
+    sqrt(mean(residuals_LM.^2)) * 1000,  % LM的RMSE
+    sqrt(mean(residuals_SVD.^2)) * 1000  % SVD的RMSE
+];
+
+% 绘制柱状图
+bar_handle = bar(rmse_values, 'FaceColor', 'flat');
+% 设置不同颜色
+bar_handle.CData(1,:) = [0 0 1];    % 蓝色
+bar_handle.CData(2,:) = [1 0 0];    % 红色
+bar_handle.CData(3,:) = [0 1 1];    % 青色
+
+set(gca, 'XTickLabel', {'N-G法', 'LM法', 'SVD法'});
+ylabel('RMSE (μm)', 'FontSize', 10);
+title('算法精度对比', 'FontSize', 12, 'FontWeight', 'bold');
+grid on;
+
+% 在柱子上方标注数值
+for i = 1:3
+    text(i, rmse_values(i)+0.5, sprintf('%.2f', rmse_values(i)), ...
+         'HorizontalAlignment', 'center', 'FontSize', 9);
+end
+
+%% ========================================================================
+%% 第八部分: 结果总结
+%% ========================================================================
+fprintf('\n========== 仿真结果总结 ==========\n');
+fprintf('【算法性能对比】\n');
+fprintf('  %-10s | 迭代次数 | α误差(°) | β误差(°) | RMSE(μm)\n', '算法');
+fprintf('  ----------------------------------------------------------\n');
+fprintf('  %-10s | %8d | %.6f | %.6f | %7.2f\n', ...
+    'N-G法', length(history_NG.error), ...
+    abs(history_NG.alpha(end) - alpha_true), ...
+    abs(history_NG.beta(end) - beta_true), ...
+    rmse_values(1));
+fprintf('  %-10s | %8d | %.6f | %.6f | %7.2f\n', ...
+    'LM法', length(history_LM.error), ...
+    abs(history_LM.alpha(end) - alpha_true), ...
+    abs(history_LM.beta(end) - beta_true), ...
+    rmse_values(2));
+fprintf('  %-10s | %8s | %.6f | %.6f | %7.2f\n', ...
+    'SVD法', '直接解', ...
+    abs(alpha_svd - alpha_true), ...
+    abs(beta_svd - beta_true), ...
+    rmse_values(3));
+
+fprintf('\n【算法特点】\n');
+fprintf('  • Newton-Gauss法: 二阶收敛,局部最优,需要好的初值\n');
+fprintf('  • LM法: 自适应阻尼,鲁棒性强,适合病态问题\n');
+fprintf('  • SVD法: 闭式解,无需迭代,但要求点对已知\n');
+
+fprintf('\n仿真完成!\n');
+
+%% ========================================================================
+%% 附录: 关键概念解释
+%% ========================================================================
+% 
+% 【SE(3)群】
+%   - 特殊欧氏群,描述3D空间的刚体运动
+%   - 元素: 4×4齐次变换矩阵 g = [R, p; 0, 1]
+%   - R: 3×3旋转矩阵 (SO(3)群,满足R^T*R=I, det(R)=1)
+%   - p: 3×1平移向量
+%
+% 【准则函数 e(η)】
+%   - 物理意义: 所有测点变换后与模型点偏差的平方和
+%   - 目标: 最小化 e(η) = Σ||R^T*(p_i - p) - q_i||²
+%   - 单位: mm² (长度平方)
+%
+% 【Jacobian矩阵 J】
+%   - 尺寸: (3N)×5
+%   - 物理意义: 残差向量对参数的偏导数
+%   - 作用: 线性化非线性优化问题
+%
+% 【Newton-Gauss vs LM】
+%   - N-G: Δη = -(J^T*J)^(-1) * (J^T*r)
+%   - LM:  Δη = -(J^T*J + λI)^(-1) * (J^T*r)
+%   - 区别: LM加入阻尼项λI,防止震荡和发散
+%
+% 【SVD算法 (Kabsch)】
+%   - 输入: 两组对应点集 {q_i} ↔ {p_i}
+%   - 步骤: 去质心 → 构建H → SVD分解 → R=V*U^T
+%   - 优点: 全局最优,一步到位
+%   - 缺点: 需要已知点对对应关系
+%
+% 【收敛性分析】
+%   - N-G: 二阶收敛(误差平方级减小),但初值敏感
+%   - LM: 一阶到二阶收敛(自适应),初值鲁棒
+%   - 判据: e(η) < 10^(-6) 或 ||Δη|| < 10^(-6)
+%
+
