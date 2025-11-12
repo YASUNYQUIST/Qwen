@@ -1,6 +1,5 @@
-
 %% ========================================================================
-%% 非球面工件位姿求解 - 完整版(包含三种配准算法)
+%% 非球面工件位姿求解 - SIL算法稳定完整版
 %% ========================================================================
 clear; clc; close all;
 
@@ -9,7 +8,7 @@ R = 1000; K = -2; A4 = 0; A6 = 0;
 aperture_size = 300;
 
 % 真实姿态
-alpha_true = 2;   % 度
+alpha_true = 3;
 beta_true = 1.5;
 px_true = 10;
 py_true = -8;
@@ -17,7 +16,7 @@ pz_true = 10;
 
 sigma_noise = 0.01;  % mm
 
-% 构建旋转矩阵
+% 构建真实旋转矩阵
 Rx_true = [1, 0, 0;
            0, cosd(alpha_true), -sind(alpha_true);
            0, sind(alpha_true), cosd(alpha_true)];
@@ -27,7 +26,7 @@ Ry_true = [cosd(beta_true), 0, sind(beta_true);
 R_true = Ry_true * Rx_true;
 p_true = [px_true; py_true; pz_true];
 
-fprintf('========== 非球面位姿求解仿真 ==========\n\n');
+fprintf('========== 非球面位姿求解 - SIL算法稳定版 ==========\n\n');
 fprintf('【参数设置】\n');
 fprintf('  非球面: R=%d mm, K=%.1f\n', R, K);
 fprintf('  真实姿态: α=%.1f°, β=%.1f°, p=[%.1f,%.1f,%.1f]mm\n', ...
@@ -35,510 +34,270 @@ fprintf('  真实姿态: α=%.1f°, β=%.1f°, p=[%.1f,%.1f,%.1f]mm\n', ...
 fprintf('  测量噪声: σ=%.2f mm\n\n', sigma_noise);
 
 %% ========================================================================
-%% 生成测量数据
+%% 1. 生成测量数据
 %% ========================================================================
-fprintf('【生成实际测量数据】\n');
+fprintf('【生成测量数据】\n');
 
-% 步骤1: 定义采样网格(极坐标)
-num_rings = 2;
-points_per_ring = 8;
+sample_xy = [0, 0];  % 中心点
 
-sample_points = [0, 0];  % 中心点
-for ring = 1:num_rings
-    radius = aperture_size/2 * ring / num_rings;
-    angles = linspace(0, 2*pi*(1-1/points_per_ring), points_per_ring);
-    for theta = angles
-        x = radius * cos(theta);
-        y = radius * sin(theta);
-        sample_points = [sample_points; x, y];
-    end
+% 1/3圆环 - 8个点
+radius_1 = aperture_size/2 * (1/3);
+angles_1 = linspace(0, 2*pi, 9);
+for theta = angles_1(1:end-1)
+    sample_xy = [sample_xy; radius_1*cos(theta), radius_1*sin(theta)];
 end
 
-N_points = size(sample_points, 1);
-
-% 步骤2: 计算模型点Q(理想非球面)
-Q_model = zeros(N_points, 3);
-for i = 1:N_points
-    x = sample_points(i, 1);
-    y = sample_points(i, 2);
-    z = compute_aspherical_z(x, y, R, K, A4, A6);
-    Q_model(i, :) = [x, y, z];
+% 2/3圆环 - 8个点
+radius_2 = aperture_size/2 * (2/3);
+angles_2 = linspace(0, 2*pi, 9);
+for theta = angles_2(1:end-1)
+    sample_xy = [sample_xy; radius_2*cos(theta), radius_2*sin(theta)];
 end
 
-% 步骤3: 计算实际测量点P(XY不变,Z是倾斜后的真实值)
+N_points = size(sample_xy, 1);
+
 P_measured = zeros(N_points, 3);
-
-fprintf('  计算倾斜工件表面Z坐标...\n');
 for i = 1:N_points
-    x_W = sample_points(i, 1);
-    y_W = sample_points(i, 2);
-    z_W = compute_measured_z(x_W, y_W, R_true, p_true, R, K, A4, A6);
+    x_W = sample_xy(i, 1);
+    y_W = sample_xy(i, 2);
+    z_W = compute_measured_z_correct(x_W, y_W, R_true, p_true, R, K, A4, A6);
     P_measured(i, :) = [x_W, y_W, z_W];
-    
-    if mod(i, 5) == 0
-        fprintf('    进度: %d/%d\n', i, N_points);
-    end
 end
 
-% 步骤4: 添加测量噪声
-P_measured = P_measured + sigma_noise * randn(size(P_measured));
+% 添加噪声
+P_measured(:,3) = P_measured(:,3) + sigma_noise * randn(N_points, 1);
 
-z_diff = P_measured(:,3) - Q_model(:,3);
-fprintf('  完成! 测量点数N=%d\n', N_points);
-fprintf('  Z偏差: 均值=%.3fmm, 标准差=%.3fmm\n\n', mean(z_diff), std(z_diff));
-
-%% ========================================================================
-%% 算法1: Newton-Gauss迭代法
-%% ========================================================================
-fprintf('========== 算法1: Newton-Gauss迭代法 ==========\n');
-
-% 验证输入
-if size(Q_model,1) ~= size(P_measured,1)
-    error('模型点和测量点数量不一致!');
-end
-
-% 初始化
-alpha_0 = 0; beta_0 = 0; p_0 = [0; 0; 0];
-max_iter = 50;
-tolerance = 1e-6;
-
-history_NG = struct();
-history_NG.alpha = [];
-history_NG.beta = [];
-history_NG.px = [];
-history_NG.py = [];
-history_NG.pz = [];
-history_NG.error = [];
-
-alpha_k = alpha_0;
-beta_k = beta_0;
-p_k = p_0;
-
-fprintf('初值: α=%.2f°, β=%.2f°, p=[%.1f,%.1f,%.1f]mm\n', alpha_0, beta_0, p_0);
-fprintf('收敛条件: e(η)<%.2e 或 ||Δη||<%.2e\n\n', tolerance, tolerance);
-fprintf('Iter\t α(°)\t\t β(°)\t\t ||p||(mm)\t e(η)\t\t ||Δη||\n');
-fprintf('-------------------------------------------------------------------------\n');
-
-% 迭代求解
-for iter = 1:max_iter
-    % 构建旋转矩阵
-    Rx_k = [1, 0, 0;
-            0, cosd(alpha_k), -sind(alpha_k);
-            0, sind(alpha_k), cosd(alpha_k)];
-    Ry_k = [cosd(beta_k), 0, sind(beta_k);
-            0, 1, 0;
-           -sind(beta_k), 0, cosd(beta_k)];
-    R_k = Ry_k * Rx_k;
-    
-    % 计算残差
-    residuals = zeros(N_points, 3);
-    for i = 1:N_points
-        q_i = Q_model(i, :)';
-        p_i = P_measured(i, :)';
-        residuals(i, :) = (R_k' * (p_i - p_k) - q_i)';
-    end
-    
-    % 准则函数
-    e_k = sum(sum(residuals.^2));
-    
-    % 记录历史
-    history_NG.alpha(iter) = alpha_k;
-    history_NG.beta(iter) = beta_k;
-    history_NG.px(iter) = p_k(1);
-    history_NG.py(iter) = p_k(2);
-    history_NG.pz(iter) = p_k(3);
-    history_NG.error(iter) = e_k;
-    
-    % 构建Jacobian
-    J = zeros(3*N_points, 5);
-    r_vec = reshape(residuals', [], 1);
-    
-    for i = 1:N_points
-        q_i = Q_model(i, :)';
-        p_i = P_measured(i, :)';
-        
-        dRx_dalpha = [0, 0, 0;
-                      0, -sind(alpha_k), -cosd(alpha_k);
-                      0, cosd(alpha_k), -sind(alpha_k)] * (pi/180);
-        dR_dalpha = Ry_k * dRx_dalpha;
-        
-        dRy_dbeta = [-sind(beta_k), 0, cosd(beta_k);
-                     0, 0, 0;
-                    -cosd(beta_k), 0, -sind(beta_k)] * (pi/180);
-        dR_dbeta = dRy_dbeta * Rx_k;
-        
-        row_idx = (i-1)*3 + 1;
-        J(row_idx:row_idx+2, 1) = dR_dalpha' * (p_i - p_k);
-        J(row_idx:row_idx+2, 2) = dR_dbeta' * (p_i - p_k);
-        J(row_idx:row_idx+2, 3:5) = -R_k';
-    end
-    
-    % Newton更新
-    JTJ = J' * J;
-    JTr = J' * r_vec;
-    
-    % 检查条件数
-    if iter == 1
-        cond_num = cond(JTJ);
-        if cond_num > 1e12
-            warning('Jacobian矩阵病态(条件数=%.2e)', cond_num);
-        end
-    end
-    
-    delta_eta = -JTJ \ JTr;
-    
-    % 输出
-    fprintf('%2d\t %.6f\t %.6f\t %.6f\t %.6e\t %.6e\n', ...
-        iter, alpha_k, beta_k, norm(p_k), e_k, norm(delta_eta));
-    
-    % 收敛判断
-    converged = false;
-    if e_k < tolerance
-        fprintf('\n✓ 收敛(准则函数<阈值), 迭代%d次\n', iter);
-        converged = true;
-    elseif norm(delta_eta) < tolerance
-        fprintf('\n✓ 收敛(步长<阈值), 迭代%d次\n', iter);
-        converged = true;
-    elseif iter > 1 && abs(e_k - history_NG.error(iter-1)) < tolerance * 0.1
-        fprintf('\n✓ 收敛(准则函数变化极小), 迭代%d次\n', iter);
-        converged = true;
-    end
-    
-    if converged
-        break;
-    end
-    
-    % 更新参数
-    alpha_k = alpha_k + delta_eta(1);
-    beta_k = beta_k + delta_eta(2);
-    p_k = p_k + delta_eta(3:5);
-    
-    if iter == max_iter
-        fprintf('\n⚠ 警告: 达到最大迭代次数(%d)未收敛!\n', max_iter);
-    end
-end
-
-R_NG = Ry_k * Rx_k;
-p_NG = p_k;
-
-% 输出结果
-fprintf('\n【Newton-Gauss法结果】\n');
-fprintf('  估计位姿: α=%.6f°, β=%.6f°, p=[%.6f,%.6f,%.6f]mm\n', ...
-    alpha_k, beta_k, p_k);
-fprintf('  误差: Δα=%.6f° (%.2f角秒), Δβ=%.6f° (%.2f角秒), Δp=%.6fmm\n', ...
-    abs(alpha_k-alpha_true), abs(alpha_k-alpha_true)*3600, ...
-    abs(beta_k-beta_true), abs(beta_k-beta_true)*3600, norm(p_k-p_true));
-fprintf('  RMSE=%.4fmm (%.2fμm)\n\n', ...
-    sqrt(e_k/N_points), sqrt(e_k/N_points)*1000);
+fprintf('  采样点数: N=%d\n', N_points);
+fprintf('  完成\n\n');
 
 %% ========================================================================
-%% 算法2: Levenberg-Marquardt法
+%% 2. SIL算法求解
 %% ========================================================================
-fprintf('========== 算法2: Levenberg-Marquardt法 ==========\n');
+fprintf('========== SIL算法求解（解析导数） ==========\n');
 
-alpha_lm = alpha_0;
-beta_lm = beta_0;
-p_lm = p_0;
-lambda = 0.01;
+% 初值设置
+pz_init = mean(P_measured(:,3));  % 用测量点平均高度作为初值
+lambda_0 = [0; 0; 0; 0; pz_init];
 
-history_LM = struct();
-history_LM.alpha = [];
-history_LM.beta = [];
-history_LM.px = [];
-history_LM.py = [];
-history_LM.pz = [];
-history_LM.error = [];
-history_LM.lambda = [];
+% 信赖域参数
+Delta_max = 10;
+Delta = 1;
+eta = 0.15;
+max_iter = 100;
+tolerance = 1e-8;
 
-fprintf('初始阻尼因子: λ=%.4f\n\n', lambda);
-fprintf('Iter\t α(°)\t\t β(°)\t\t ||p||(mm)\t e(η)\t\t λ\t\t 状态\n');
+lambda_k = lambda_0;
+
+% 预分配历史记录
+history = struct();
+history.lambda = zeros(5, max_iter);
+history.Psi = zeros(1, max_iter);
+history.Delta = zeros(1, max_iter);
+history.status = cell(1, max_iter);
+
+fprintf('初值: α=%.2f°, β=%.2f°, p=[%.1f,%.1f,%.1f]mm\n\n', ...
+    lambda_0(1), lambda_0(2), lambda_0(3:5));
+fprintf('Iter\t α(°)\t\t β(°)\t\t ||p||(mm)\t Ψ(λ)\t\t Δ\t\t 状态\n');
 fprintf('-------------------------------------------------------------------------------------\n');
 
+actual_iters = max_iter;
+
 for iter = 1:max_iter
-    % 构建旋转矩阵
-    Rx_lm = [1, 0, 0;
-             0, cosd(alpha_lm), -sind(alpha_lm);
-             0, sind(alpha_lm), cosd(alpha_lm)];
-    Ry_lm = [cosd(beta_lm), 0, sind(beta_lm);
-             0, 1, 0;
-            -sind(beta_lm), 0, cosd(beta_lm)];
-    R_lm = Ry_lm * Rx_lm;
-    
-    % 计算残差
-    residuals = zeros(N_points, 3);
-    for i = 1:N_points
-        q_i = Q_model(i, :)';
-        p_i = P_measured(i, :)';
-        residuals(i, :) = (R_lm' * (p_i - p_lm) - q_i)';
-    end
-    e_lm = sum(sum(residuals.^2));
+    % 计算当前准则函数
+    Psi_k = evaluate_criterion(P_measured, lambda_k, R, K, A4, A6);
     
     % 记录历史
-    history_LM.alpha(iter) = alpha_lm;
-    history_LM.beta(iter) = beta_lm;
-    history_LM.px(iter) = p_lm(1);
-    history_LM.py(iter) = p_lm(2);
-    history_LM.pz(iter) = p_lm(3);
-    history_LM.error(iter) = e_lm;
-    history_LM.lambda(iter) = lambda;
+    history.lambda(:, iter) = lambda_k;
+    history.Psi(iter) = Psi_k;
+    history.Delta(iter) = Delta;
     
-    % 构建Jacobian
-    J = zeros(3*N_points, 5);
-    r_vec = reshape(residuals', [], 1);
+    % 计算解析梯度和Hessian
+    [grad, H] = compute_gradient_hessian_analytic(P_measured, lambda_k, R, K, A4, A6);
     
-    for i = 1:N_points
-        q_i = Q_model(i, :)';
-        p_i = P_measured(i, :)';
-        
-        dRx_dalpha = [0, 0, 0;
-                      0, -sind(alpha_lm), -cosd(alpha_lm);
-                      0, cosd(alpha_lm), -sind(alpha_lm)] * (pi/180);
-        dR_dalpha = Ry_lm * dRx_dalpha;
-        
-        dRy_dbeta = [-sind(beta_lm), 0, cosd(beta_lm);
-                     0, 0, 0;
-                    -cosd(beta_lm), 0, -sind(beta_lm)] * (pi/180);
-        dR_dbeta = dRy_dbeta * Rx_lm;
-        
-        row_idx = (i-1)*3 + 1;
-        J(row_idx:row_idx+2, 1) = dR_dalpha' * (p_i - p_lm);
-        J(row_idx:row_idx+2, 2) = dR_dbeta' * (p_i - p_lm);
-        J(row_idx:row_idx+2, 3:5) = -R_lm';
+    % 添加正则化
+    H = H + 1e-6 * eye(5);
+    
+    % 求解信赖域子问题
+    delta_lambda = solve_trust_region_subproblem(grad, H, Delta);
+    
+    % 尝试新参数
+    lambda_new = lambda_k + delta_lambda;
+    Psi_new = evaluate_criterion(P_measured, lambda_new, R, K, A4, A6);
+    
+    % 计算信赖域比率
+    actual_reduction = Psi_k - Psi_new;
+    predicted_reduction = -(grad' * delta_lambda + 0.5 * delta_lambda' * H * delta_lambda);
+    
+    if abs(predicted_reduction) < 1e-12
+        rho = 0;
+    else
+        rho = actual_reduction / predicted_reduction;
     end
     
-    % LM更新
-    A = J' * J;
-    b = J' * r_vec;
-    delta_eta = -(A + lambda * eye(5)) \ b;
-    
-    % 尝试更新
-    alpha_new = alpha_lm + delta_eta(1);
-    beta_new = beta_lm + delta_eta(2);
-    p_new = p_lm + delta_eta(3:5);
-    
-    % 计算新误差
-    Rx_new = [1, 0, 0;
-              0, cosd(alpha_new), -sind(alpha_new);
-              0, sind(alpha_new), cosd(alpha_new)];
-    Ry_new = [cosd(beta_new), 0, sind(beta_new);
-              0, 1, 0;
-             -sind(beta_new), 0, cosd(beta_new)];
-    R_new = Ry_new * Rx_new;
-    
-    residuals_new = zeros(N_points, 3);
-    for i = 1:N_points
-        q_i = Q_model(i, :)';
-        p_i = P_measured(i, :)';
-        residuals_new(i, :) = (R_new' * (p_i - p_new) - q_i)';
-    end
-    e_new = sum(sum(residuals_new.^2));
-    
-    % 自适应调整λ
-    if e_new < e_lm
+    % 更新策略
+    if rho > eta
+        lambda_k = lambda_new;
         status = '接受';
-        alpha_lm = alpha_new;
-        beta_lm = beta_new;
-        p_lm = p_new;
-        lambda = max(lambda / 10, 1e-10);
+        
+        if rho > 0.75 && Delta < Delta_max
+            Delta = min(2 * Delta, Delta_max);
+        end
     else
         status = '拒绝';
-        lambda = min(lambda * 10, 1e10);
+        Delta = Delta / 2;
     end
     
-    fprintf('%2d\t %.6f\t %.6f\t %.6f\t %.6e\t %.4e\t %s\n', ...
-        iter, alpha_lm, beta_lm, norm(p_lm), e_lm, lambda, status);
+    history.status{iter} = status;
+    
+    fprintf('%2d\t %.6f\t %.6f\t %.6f\t %.6e\t %.4f\t %s\n', ...
+        iter, lambda_k(1), lambda_k(2), norm(lambda_k(3:5)), Psi_k, Delta, status);
     
     % 收敛判断
-    if e_lm < tolerance
-        fprintf('\n✓ 收敛! 迭代%d次\n', iter);
+    if Psi_k < tolerance
+        actual_iters = iter;
+        fprintf('\n✓ 收敛(准则函数<阈值)! 迭代%d次\n', iter);
         break;
     end
     
-    if iter == max_iter
-        fprintf('\n⚠ 警告: 达到最大迭代次数(%d)\n', max_iter);
+    if norm(delta_lambda) < tolerance && strcmp(status, '接受')
+        actual_iters = iter;
+        fprintf('\n✓ 收敛(步长<阈值)! 迭代%d次\n', iter);
+        break;
+    end
+    
+    if Delta < 1e-8
+        actual_iters = iter;
+        fprintf('\n⚠ 信赖域过小，终止迭代\n');
+        break;
     end
 end
 
-R_LM = Ry_lm * Rx_lm;  % 使用最终接受的参数
-p_LM = p_lm;
+% 裁剪历史
+history.lambda = history.lambda(:, 1:actual_iters);
+history.Psi = history.Psi(1:actual_iters);
+history.Delta = history.Delta(1:actual_iters);
+history.status = history.status(1:actual_iters);
 
-fprintf('\n【Levenberg-Marquardt法结果】\n');
-fprintf('  估计位姿: α=%.6f°, β=%.6f°, p=[%.6f,%.6f,%.6f]mm\n', ...
-    alpha_lm, beta_lm, p_lm);
-fprintf('  误差: Δα=%.6f°, Δβ=%.6f°, Δp=%.6fmm\n', ...
-    abs(alpha_lm-alpha_true), abs(beta_lm-beta_true), norm(p_lm-p_true));
-fprintf('  RMSE=%.4fmm (%.2fμm)\n\n', ...
-    sqrt(e_lm/N_points), sqrt(e_lm/N_points)*1000);
+alpha_SIL = lambda_k(1);
+beta_SIL = lambda_k(2);
+p_SIL = lambda_k(3:5);
 
-%% ========================================================================
-%% 算法3: SVD闭式解
-%% ========================================================================
-fprintf('========== 算法3: SVD闭式解 ==========\n');
+rmse_SIL = sqrt(Psi_k / N_points);
 
-centroid_P = mean(P_measured, 1)';
-centroid_Q = mean(Q_model, 1)';
-
-P_centered = P_measured - centroid_P';
-Q_centered = Q_model - centroid_Q';
-
-H = Q_centered' * P_centered;
-[U, ~, V] = svd(H);
-
-R_SVD = V * U';
-if det(R_SVD) < 0
-    V(:, 3) = -V(:, 3);
-    R_SVD = V * U';
-end
-
-p_SVD = centroid_Q - R_SVD * centroid_P;
-
-% 提取欧拉角(修正版)
-beta_svd = asind(-R_SVD(3,1));
-if abs(cosd(beta_svd)) > 1e-6
-    alpha_svd = atan2d(R_SVD(3,2), R_SVD(3,3));
-else
-    alpha_svd = atan2d(-R_SVD(2,3), R_SVD(2,2));
-    warning('SVD: 接近万向节锁');
-end
-
-% 计算残差
-residuals_SVD = vecnorm((R_SVD*Q_model')' + p_SVD' - P_measured, 2, 2);
-rmse_SVD = sqrt(mean(residuals_SVD.^2));
-
-fprintf('  估计位姿: α=%.6f°, β=%.6f°, p=[%.6f,%.6f,%.6f]mm\n', ...
-    alpha_svd, beta_svd, p_SVD);
-fprintf('  误差: Δα=%.6f°, Δβ=%.6f°, Δp=%.6fmm\n', ...
-    abs(alpha_svd-alpha_true), abs(beta_svd-beta_true), norm(p_SVD-p_true));
-fprintf('  RMSE=%.4fmm (%.2fμm)\n\n', rmse_SVD, rmse_SVD*1000);
+fprintf('\n【SIL算法结果】\n');
+fprintf('  估计值: α=%.6f°, β=%.6f°, p=[%.3f, %.3f, %.3f]mm\n', ...
+    alpha_SIL, beta_SIL, p_SIL);
+fprintf('  真实值: α=%.6f°, β=%.6f°, p=[%.3f, %.3f, %.3f]mm\n', ...
+    alpha_true, beta_true, p_true);
+fprintf('  误  差: Δα=%.6f° (%.2f〞), Δβ=%.6f° (%.2f〞), Δp=%.6fmm\n', ...
+    abs(alpha_SIL-alpha_true), abs(alpha_SIL-alpha_true)*3600, ...
+    abs(beta_SIL-beta_true), abs(beta_SIL-beta_true)*3600, ...
+    norm(p_SIL-p_true));
+fprintf('  RMSE: %.4fmm (%.1fμm)\n\n', rmse_SIL, rmse_SIL*1000);
 
 %% ========================================================================
-%% 可视化结果
+%% 3. 可视化
 %% ========================================================================
-fprintf('========== 生成可视化 ==========\n');
+fprintf('【生成可视化】\n');
 
-figure('Position', [50, 50, 1800, 900], 'Name', '非球面位姿求解结果');
+figure('Position', [50, 50, 1600, 800], 'Name', 'SIL算法结果');
 
-% 子图1: 配准前
-subplot(2,4,1);
-plot3(Q_model(:,1), Q_model(:,2), Q_model(:,3), 'bo', 'MarkerSize', 8);
+% 子图1: 准则函数收敛
+subplot(2,3,1);
+semilogy(1:actual_iters, history.Psi, 'b-o', 'LineWidth', 1.5, 'MarkerSize', 5);
+xlabel('迭代次数');
+ylabel('Ψ(λ)');
+title('准则函数收敛曲线');
+grid on;
+xlim([1, actual_iters]);
+
+% 子图2: 信赖域半径
+subplot(2,3,2);
+plot(1:actual_iters, history.Delta, 'r-s', 'LineWidth', 1.5, 'MarkerSize', 5);
+xlabel('迭代次数');
+ylabel('Δ');
+title('信赖域半径变化');
+grid on;
+xlim([1, actual_iters]);
+
+% 子图3: 角度参数收敛
+subplot(2,3,3);
+plot(1:actual_iters, history.lambda(1,:), 'b-', 'LineWidth', 1.5, 'DisplayName', 'α估计');
 hold on;
-plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), 'r^', 'MarkerSize', 8);
-xlabel('X(mm)'); ylabel('Y(mm)'); zlabel('Z(mm)');
-title('配准前'); legend('模型点Q', '测量点P');
-grid on; axis equal; view(45,30);
+plot(1:actual_iters, history.lambda(2,:), 'r-', 'LineWidth', 1.5, 'DisplayName', 'β估计');
+yline(alpha_true, 'b--', 'LineWidth', 1.5, 'DisplayName', 'α真值');
+yline(beta_true, 'r--', 'LineWidth', 1.5, 'DisplayName', 'β真值');
+xlabel('迭代次数');
+ylabel('角度(°)');
+title('旋转角收敛');
+legend('Location', 'best');
+grid on;
+xlim([1, actual_iters]);
 
-% 子图2: N-G配准后
-subplot(2,4,2);
-Q_NG_trans = (R_NG*Q_model')' + p_NG';
-plot3(Q_NG_trans(:,1), Q_NG_trans(:,2), Q_NG_trans(:,3), 'go', 'MarkerSize', 8);
+% 子图4: 平移参数收敛
+subplot(2,3,4);
+plot(1:actual_iters, history.lambda(3,:), 'b-', 'LineWidth', 1.5, 'DisplayName', 'px');
 hold on;
-plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), 'r^', 'MarkerSize', 8);
-for i=1:N_points
-    plot3([Q_NG_trans(i,1), P_measured(i,1)], ...
-          [Q_NG_trans(i,2), P_measured(i,2)], ...
-          [Q_NG_trans(i,3), P_measured(i,3)], 'k--', 'LineWidth', 0.5);
-end
-xlabel('X(mm)'); ylabel('Y(mm)'); zlabel('Z(mm)');
-title('N-G配准后'); legend('配准后Q', '测量点P');
-grid on; axis equal; view(45,30);
+plot(1:actual_iters, history.lambda(4,:), 'r-', 'LineWidth', 1.5, 'DisplayName', 'py');
+plot(1:actual_iters, history.lambda(5,:), 'g-', 'LineWidth', 1.5, 'DisplayName', 'pz');
+yline(px_true, 'b--', 'LineWidth', 1);
+yline(py_true, 'r--', 'LineWidth', 1);
+yline(pz_true, 'g--', 'LineWidth', 1);
+xlabel('迭代次数');
+ylabel('平移(mm)');
+title('平移向量收敛');
+legend('Location', 'best');
+grid on;
+xlim([1, actual_iters]);
 
-% 子图3: LM配准后
-subplot(2,4,3);
-Q_LM_trans = (R_LM*Q_model')' + p_LM';
-plot3(Q_LM_trans(:,1), Q_LM_trans(:,2), Q_LM_trans(:,3), 'mo', 'MarkerSize', 8);
+% 子图5: 配准残差分布
+subplot(2,3,5);
+Rx_final = [1, 0, 0;
+            0, cosd(alpha_SIL), -sind(alpha_SIL);
+            0, sind(alpha_SIL), cosd(alpha_SIL)];
+Ry_final = [cosd(beta_SIL), 0, sind(beta_SIL);
+            0, 1, 0;
+           -sind(beta_SIL), 0, cosd(beta_SIL)];
+R_SIL = Ry_final * Rx_final;
+
+residuals_final = zeros(N_points, 1);
+for i = 1:N_points
+    p_i = P_measured(i, :)';
+    p_transformed = R_SIL' * (p_i - p_SIL);
+    z_surface = compute_aspherical_z(p_transformed(1), p_transformed(2), R, K, A4, A6);
+    if ~isnan(z_surface)
+        residuals_final(i) = abs(z_surface - p_transformed(3));
+    end
+end
+
+stem(1:N_points, residuals_final*1000, 'filled', 'LineWidth', 1.5);
 hold on;
-plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), 'r^', 'MarkerSize', 8);
-for i=1:N_points
-    plot3([Q_LM_trans(i,1), P_measured(i,1)], ...
-          [Q_LM_trans(i,2), P_measured(i,2)], ...
-          [Q_LM_trans(i,3), P_measured(i,3)], 'k--', 'LineWidth', 0.5);
-end
-xlabel('X(mm)'); ylabel('Y(mm)'); zlabel('Z(mm)');
-title('LM配准后'); legend('配准后Q', '测量点P');
-grid on; axis equal; view(45,30);
+yline(mean(residuals_final*1000), 'r--', 'LineWidth', 2, 'DisplayName', '平均值');
+xlabel('测量点编号');
+ylabel('残差(μm)');
+title(sprintf('配准残差 (RMSE=%.1fμm)', rmse_SIL*1000));
+legend('Location', 'best');
+grid on;
 
-% 子图4: SVD配准后
-subplot(2,4,4);
-Q_SVD_trans = (R_SVD*Q_model')' + p_SVD';
-plot3(Q_SVD_trans(:,1), Q_SVD_trans(:,2), Q_SVD_trans(:,3), 'co', 'MarkerSize', 8);
-hold on;
-plot3(P_measured(:,1), P_measured(:,2), P_measured(:,3), 'r^', 'MarkerSize', 8);
-for i=1:N_points
-    plot3([Q_SVD_trans(i,1), P_measured(i,1)], ...
-          [Q_SVD_trans(i,2), P_measured(i,2)], ...
-          [Q_SVD_trans(i,3), P_measured(i,3)], 'k--', 'LineWidth', 0.5);
-end
-xlabel('X(mm)'); ylabel('Y(mm)'); zlabel('Z(mm)');
-title('SVD配准后'); legend('配准后Q', '测量点P');
-grid on; axis equal; view(45,30);
+% 子图6: 接受/拒绝统计
+subplot(2,3,6);
+accept_count = sum(strcmp(history.status, '接受'));
+reject_count = sum(strcmp(history.status, '拒绝'));
+bar([accept_count, reject_count]);
+set(gca, 'XTickLabel', {'接受', '拒绝'});
+ylabel('次数');
+title('迭代步长统计');
+text(1, accept_count+1, num2str(accept_count), 'HorizontalAlignment', 'center');
+text(2, reject_count+1, num2str(reject_count), 'HorizontalAlignment', 'center');
+grid on;
 
-% 子图5: N-G收敛曲线
-subplot(2,4,5);
-semilogy(1:length(history_NG.error), history_NG.error, 'b-o', 'LineWidth', 1.5);
-xlabel('迭代次数'); ylabel('准则函数e(η)');
-title('N-G收敛曲线'); grid on;
-
-% 子图6: LM收敛曲线
-subplot(2,4,6);
-semilogy(1:length(history_LM.error), history_LM.error, 'r-s', 'LineWidth', 1.5);
-xlabel('迭代次数'); ylabel('准则函数e(η)');
-title('LM收敛曲线'); grid on;
-
-% 子图7: LM阻尼因子
-subplot(2,4,7);
-semilogy(1:length(history_LM.lambda), history_LM.lambda, 'm-d', 'LineWidth', 1.5);
-xlabel('迭代次数'); ylabel('阻尼因子λ');
-title('LM自适应阻尼'); grid on;
-
-% 子图8: 精度对比
-subplot(2,4,8);
-residuals_NG_norm = vecnorm(Q_NG_trans - P_measured, 2, 2);
-residuals_LM_norm = vecnorm(Q_LM_trans - P_measured, 2, 2);
-rmse_values = [
-    sqrt(mean(residuals_NG_norm.^2))*1000;
-    sqrt(mean(residuals_LM_norm.^2))*1000;
-    rmse_SVD*1000
-];
-bar_h = bar(rmse_values, 'FaceColor', 'flat');
-bar_h.CData(1,:) = [0 0 1];
-bar_h.CData(2,:) = [1 0 0];
-bar_h.CData(3,:) = [0 1 1];
-set(gca, 'XTickLabel', {'N-G', 'LM', 'SVD'});
-ylabel('RMSE (μm)');
-title('算法精度对比'); grid on;
-for i=1:3
-    text(i, rmse_values(i)+0.5, sprintf('%.2f', rmse_values(i)), ...
-         'HorizontalAlignment', 'center');
-end
-
-%% ========================================================================
-%% 结果总结
-%% ========================================================================
-fprintf('\n========== 仿真结果总结 ==========\n');
-fprintf('%-8s | 迭代 | α误差(°) | β误差(°) | p误差(mm) | RMSE(μm)\n', '算法');
-fprintf('------------------------------------------------------------------\n');
-fprintf('%-8s | %4d | %.6f | %.6f | %.6f | %7.2f\n', ...
-    'N-G', length(history_NG.error), ...
-    abs(alpha_k-alpha_true), abs(beta_k-beta_true), ...
-    norm(p_k-p_true), rmse_values(1));
-fprintf('%-8s | %4d | %.6f | %.6f | %.6f | %7.2f\n', ...
-    'LM', length(history_LM.error), ...
-    abs(alpha_lm-alpha_true), abs(beta_lm-beta_true), ...
-    norm(p_lm-p_true), rmse_values(2));
-fprintf('%-8s | %4s | %.6f | %.6f | %.6f | %7.2f\n', ...
-    'SVD', '直接', ...
-    abs(alpha_svd-alpha_true), abs(beta_svd-beta_true), ...
-    norm(p_SVD-p_true), rmse_values(3));
-
-fprintf('\n仿真完成!\n');
+fprintf('可视化完成!\n');
 
 %% ========================================================================
 %% 辅助函数
 %% ========================================================================
 
-
 function z = compute_aspherical_z(x, y, R, K, A4, A6)
-    % 计算非球面Z坐标
     rho = sqrt(x^2 + y^2);
     c = 1 / R;
     discriminant = 1 - (1 + K) * c^2 * rho^2;
@@ -550,57 +309,247 @@ function z = compute_aspherical_z(x, y, R, K, A4, A6)
     end
 end
 
-function z_W = compute_measured_z(x_W, y_W, R_true, p_true, R, K, A4, A6)
-    % 计算测头在(x_W,y_W)接触倾斜工件的Z坐标
-    % 通过迭代求解满足非球面约束的接触点
-    
+function z_W = compute_measured_z_correct(x_W, y_W, R_true, p_true, R, K, A4, A6)
     R_inv = R_true';
-    z_W = p_true(3);  % 初始猜测:工件中心高度
+    z_ideal = compute_aspherical_z(x_W, y_W, R, K, A4, A6);
+    z_W = z_ideal + p_true(3);
     
-    max_iter = 50;
-    tol = 1e-8;
+    max_iter = 100;
+    tol = 1e-9;
     
     for iter = 1:max_iter
-        % 当前猜测下的机床系坐标
         p_W = [x_W; y_W; z_W];
-        
-        % 变换到工件坐标系
         p_M = R_inv * (p_W - p_true);
-        x_M = p_M(1); 
-        y_M = p_M(2); 
+        x_M = p_M(1);
+        y_M = p_M(2);
         z_M = p_M(3);
         
-        % 计算非球面理论Z值
         z_M_theory = compute_aspherical_z(x_M, y_M, R, K, A4, A6);
         
         if isnan(z_M_theory)
             z_W = NaN;
-            warning('点(%.1f,%.1f)超出非球面定义域', x_W, y_W);
             return;
         end
         
-        % 残差:当前z_M与非球面约束的偏差
         residual = z_M - z_M_theory;
         
-        % 收敛判断
         if abs(residual) < tol
             break;
         end
         
-        % Newton迭代更新
-        % Jacobian简化:∂residual/∂z_W ≈ R_inv(3,3)
-        J = R_inv(3, 3);
+        rho = sqrt(x_M^2 + y_M^2);
+        c = 1 / R;
+        discriminant = 1 - (1 + K) * c^2 * rho^2;
         
-        if abs(J) > 1e-10
+        if rho > 1e-8 && discriminant > 1e-10
+            sqrt_disc = sqrt(discriminant);
+            dz_drho = (c * 2 * rho) / (1 + sqrt_disc) ...
+                      + (c^3 * (1+K) * rho^3) / ((1 + sqrt_disc)^2 * sqrt_disc) ...
+                      + 4 * A4 * rho^3 + 6 * A6 * rho^5;
+            
+            dz_dx_M = dz_drho * (x_M / rho);
+            dz_dy_M = dz_drho * (y_M / rho);
+            
+            J = R_inv(3,3) - dz_dx_M*R_inv(1,3) - dz_dy_M*R_inv(2,3);
+        else
+            J = R_inv(3,3);
+        end
+        
+        if abs(J) > 1e-12
             z_W = z_W - residual / J;
         else
-            warning('Jacobian接近奇异,迭代终止');
             break;
         end
     end
+end
+
+function Psi = evaluate_criterion(P_measured, lambda, R, K, A4, A6)
+    alpha = lambda(1);
+    beta = lambda(2);
+    p = lambda(3:5);
     
-    if iter == max_iter
-        warning('compute_measured_z: 迭代未收敛 (x_W=%.1f, y_W=%.1f)', x_W, y_W);
+    Rx = [1, 0, 0;
+          0, cosd(alpha), -sind(alpha);
+          0, sind(alpha), cosd(alpha)];
+    Ry = [cosd(beta), 0, sind(beta);
+          0, 1, 0;
+         -sind(beta), 0, cosd(beta)];
+    R_mat = Ry * Rx;
+    
+    Psi = 0;
+    N_points = size(P_measured, 1);
+    
+    for i = 1:N_points
+        p_i = P_measured(i, :)';
+        p_transformed = R_mat' * (p_i - p);
+        
+        x_prime = p_transformed(1);
+        y_prime = p_transformed(2);
+        z_prime = p_transformed(3);
+        
+        z_surface = compute_aspherical_z(x_prime, y_prime, R, K, A4, A6);
+        
+        if ~isnan(z_surface)
+            Psi = Psi + (z_surface - z_prime)^2;
+        end
     end
 end
 
+function [grad, H] = compute_gradient_hessian_analytic(P_measured, lambda, R, K, A4, A6)
+    alpha = lambda(1);
+    beta = lambda(2);
+    p = lambda(3:5);
+    
+    N_points = size(P_measured, 1);
+    
+    % 构建旋转矩阵
+    Rx = [1, 0, 0;
+          0, cosd(alpha), -sind(alpha);
+          0, sind(alpha), cosd(alpha)];
+    Ry = [cosd(beta), 0, sind(beta);
+          0, 1, 0;
+         -sind(beta), 0, cosd(beta)];
+    R_mat = Ry * Rx;
+    
+    % 旋转矩阵的导数（弧度制）
+    dRx_dalpha = [0, 0, 0;
+                  0, -sind(alpha), -cosd(alpha);
+                  0, cosd(alpha), -sind(alpha)] * (pi/180);
+    
+    dRy_dbeta = [-sind(beta), 0, cosd(beta);
+                 0, 0, 0;
+                -cosd(beta), 0, -sind(beta)] * (pi/180);
+    
+    dR_dalpha = Ry * dRx_dalpha;
+    dR_dbeta = dRy_dbeta * Rx;
+    
+    % 初始化
+    grad = zeros(5, 1);
+    H = zeros(5, 5);
+    
+    for i = 1:N_points
+        p_i = P_measured(i, :)';
+        p_diff = p_i - p;
+        
+        % 变换到工件系
+        p_prime = R_mat' * p_diff;
+        x_prime = p_prime(1);
+        y_prime = p_prime(2);
+        z_prime = p_prime(3);
+        
+        % 非球面Z值
+        z_surf = compute_aspherical_z(x_prime, y_prime, R, K, A4, A6);
+        
+        if isnan(z_surf)
+            continue;
+        end
+        
+        % 残差
+        r_i = z_surf - z_prime;
+        
+        % 非球面偏导数
+        [df_dx, df_dy] = compute_surface_derivatives(x_prime, y_prime, R, K, A4, A6);
+        
+        if isnan(df_dx)
+            continue;
+        end
+        
+        % 变换后坐标对参数的导数
+        dp_dalpha = dR_dalpha' * p_diff;
+        dp_dbeta = dR_dbeta' * p_diff;
+        dp_dp = -R_mat';
+        
+        % 残差对参数的导数（链式法则）
+        dr_dalpha = df_dx * dp_dalpha(1) + df_dy * dp_dalpha(2) - dp_dalpha(3);
+        dr_dbeta = df_dx * dp_dbeta(1) + df_dy * dp_dbeta(2) - dp_dbeta(3);
+        
+        dr_dp = zeros(3, 1);
+        for k = 1:3
+            dr_dp(k) = df_dx * dp_dp(1, k) + df_dy * dp_dp(2, k) - dp_dp(3, k);
+        end
+        
+        % 梯度：∂Ψ/∂λ = 2 * Σ r_i * (∂r_i/∂λ)
+        grad(1) = grad(1) + 2 * r_i * dr_dalpha;
+        grad(2) = grad(2) + 2 * r_i * dr_dbeta;
+        grad(3:5) = grad(3:5) + 2 * r_i * dr_dp;
+        
+        % Hessian（Gauss-Newton近似）
+        J_i = [dr_dalpha; dr_dbeta; dr_dp];
+        H = H + 2 * (J_i * J_i');
+    end
+end
+
+function [df_dx, df_dy] = compute_surface_derivatives(x, y, R, K, A4, A6)
+    rho = sqrt(x^2 + y^2);
+    
+    if rho < 1e-10
+        df_dx = 0;
+        df_dy = 0;
+        return;
+    end
+    
+    c = 1 / R;
+    discriminant = 1 - (1 + K) * c^2 * rho^2;
+    
+    if discriminant <= 0
+        df_dx = NaN;
+        df_dy = NaN;
+        return;
+    end
+    
+    sqrt_disc = sqrt(discriminant);
+    
+    % ∂f/∂ρ
+    df_drho = (c * 2 * rho) / (1 + sqrt_disc) ...
+              + (c^3 * (1+K) * rho^3) / ((1 + sqrt_disc)^2 * sqrt_disc) ...
+              + 4 * A4 * rho^3 + 6 * A6 * rho^5;
+    
+    % 链式法则
+    df_dx = df_drho * (x / rho);
+    df_dy = df_drho * (y / rho);
+end
+
+function s = solve_trust_region_subproblem(grad, H, Delta)
+    g_norm = norm(grad);
+    if g_norm < 1e-12
+        s = zeros(size(grad));
+        return;
+    end
+    
+    % 无约束Newton步
+    if rcond(H) > 1e-10
+        s_newton = -H \ grad;
+    else
+        s_newton = -pinv(H) * grad;
+    end
+    
+    % Newton步在信赖域内
+    if norm(s_newton) <= Delta
+        s = s_newton;
+        return;
+    end
+    
+    % Cauchy步
+    tau = min(1, Delta / g_norm);
+    s_cauchy = -tau * Delta / g_norm * grad;
+    
+    if norm(s_cauchy) >= Delta
+        s = s_cauchy;
+        return;
+    end
+    
+    % Dogleg路径
+    a = norm(s_newton - s_cauchy)^2;
+    b = 2 * s_cauchy' * (s_newton - s_cauchy);
+    c = norm(s_cauchy)^2 - Delta^2;
+    
+    discriminant = b^2 - 4*a*c;
+    if discriminant >= 0
+        tau = (-b + sqrt(discriminant)) / (2*a);
+        tau = max(0, min(1, tau));
+    else
+        tau = 1;
+    end
+    
+    s = s_cauchy + tau * (s_newton - s_cauchy);
+end
