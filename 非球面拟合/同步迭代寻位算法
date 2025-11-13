@@ -730,6 +730,46 @@ fprintf('\n仿真完成!\n');
 %   - 判据: e(η) < 10^(-6) 或 ||Δη|| < 10^(-6)
 %
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 %% ========================================================================
 %% 非球面工件位姿求解 - 详细注释版 (适合新手学习)
 %% 实现文档2.3节迭代优化 + 2.4节仿真验证
@@ -782,30 +822,34 @@ fprintf('  测量误差: σ=%.2f mm (%.0f μm)\n\n', sigma_noise, sigma_noise*10
 %% 第二部分: 生成测量点 (对应文档2.4.2节)
 %% ========================================================================
 
-% --- 2.1 选择采样方案 ---
-% 定义三种测点分布方案
-sampling_schemes = {
-    struct('name', '3×3网格(9点)',  'grid', 3),   % 稀疏采样
-    struct('name', '5×5网格(25点)', 'grid', 5),   % 中等采样(推荐)
-    struct('name', '7×7网格(49点)', 'grid', 7)    % 密集采样
-};
-
-scheme_idx = 2;  % 选择第2种方案 (可改为1或3试验不同效果)
-scheme = sampling_schemes{scheme_idx};
-grid_size = scheme.grid;  % 网格大小: 5×5
-
+%% ========================================================================
+%% 第二部分: 生成测量点 - 同心圆环采样方案(改进版)
+%% ========================================================================
 fprintf('【测点分布】\n');
-fprintf('  方案: %s\n', scheme.name);
+fprintf('  方案: 同心圆环采样 (1/3r + 2/3r)\n');
 
-% --- 2.2 生成均匀网格坐标 ---
-% linspace(起点, 终点, 点数) - 生成等间距数组
-x_range = linspace(-aperture_size/2, aperture_size/2, grid_size);
-y_range = linspace(-aperture_size/2, aperture_size/2, grid_size);
+% --- 2.1 定义圆环采样参数 ---
+num_points_per_ring = 8;
+ring_radii = [1/3, 2/3];
 
-% meshgrid - 将1D数组扩展为2D网格
-% 例如: x_range=[-150, -75, 0, 75, 150]
-%       生成5×5网格,X_grid的每一行都是[-150,-75,0,75,150]
-[X_grid, Y_grid] = meshgrid(x_range, y_range);
+% --- 2.2 生成XY坐标(工件坐标系) ---
+sample_xy = [0, 0];  % 中心点
+
+% 内圆环
+radius_1 = aperture_size/2 * ring_radii(1);
+angles_1 = linspace(0, 2*pi, num_points_per_ring + 1);
+for k = 1:num_points_per_ring
+    theta = angles_1(k);
+    sample_xy = [sample_xy; radius_1*cos(theta), radius_1*sin(theta)];
+end
+
+% 外圆环
+radius_2 = aperture_size/2 * ring_radii(2);
+angles_2 = linspace(0, 2*pi, num_points_per_ring + 1);
+for k = 1:num_points_per_ring
+    theta = angles_2(k);
+    sample_xy = [sample_xy; radius_2*cos(theta), radius_2*sin(theta)];
+end
 
 % --- 2.3 计算非球面Z坐标 (式2.27) ---
 % 对网格上每个点(x,y)计算对应的z值
