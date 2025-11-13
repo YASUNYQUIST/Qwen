@@ -553,3 +553,219 @@ function s = solve_trust_region_subproblem(grad, H, Delta)
     
     s = s_cauchy + tau * (s_newton - s_cauchy);
 end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+%% ========== 测试示例 ==========
+clear; clc;
+
+% 非球面参数
+R = 1000;
+K = -2;
+A4 = 0;
+A6 = 0;
+
+% 工件位姿
+alpha_true = 2;    % 度
+beta_true = 1.5;
+t_true = [10; -8; 10];  % mm
+
+Rx = [1, 0, 0;
+      0, cosd(alpha_true), -sind(alpha_true);
+      0, sind(alpha_true),  cosd(alpha_true)];
+Ry = [cosd(beta_true), 0, sind(beta_true);
+      0, 1, 0;
+     -sind(beta_true), 0, cosd(beta_true)];
+R_true = Ry * Rx;
+
+% 测试点: 机床坐标系 (1, 2, ?)
+x_W = 1;
+y_W = 2;
+
+fprintf('========== 固定XY点的Z值求解 ==========\n\n');
+fprintf('【工件位姿】\n');
+fprintf('  旋转角: α=%.2f°, β=%.2f°\n', alpha_true, beta_true);
+fprintf('  平移: t=[%.1f, %.1f, %.1f]mm\n\n', t_true);
+
+fprintf('【查询点】机床坐标系\n');
+fprintf('  固定XY: (%.1f, %.1f, ?)\n\n', x_W, y_W);
+
+% === 方法1: 原始状态(无变换) ===
+z_original = compute_aspherical_z(x_W, y_W, R, K, A4, A6);
+fprintf('【方法1】原始状态(工件未变换)\n');
+fprintf('  直接代入: z = %.6f mm\n\n', z_original);
+
+% === 方法2: 精确求解(考虑变换) ===
+tic;
+z_transformed = compute_z_at_fixed_xy(x_W, y_W, R_true, t_true, R, K, A4, A6);
+time_elapsed = toc;
+
+fprintf('【方法2】变换后状态(精确迭代)\n');
+fprintf('  求解结果: z = %.6f mm\n', z_transformed);
+fprintf('  计算耗时: %.3f ms\n', time_elapsed*1000);
+fprintf('  Z值差异: Δz = %.6f mm (%.1f μm)\n\n', ...
+        abs(z_transformed - z_original), ...
+        abs(z_transformed - z_original)*1000);
+
+% === 验证正确性 ===
+fprintf('【验证】反变换检查\n');
+p_W_final = [x_W; y_W; z_transformed];
+p_M_check = R_true' * (p_W_final - t_true);
+
+fprintf('  反变换到工件坐标系:\n');
+fprintf('    x_M = %.6f mm\n', p_M_check(1));
+fprintf('    y_M = %.6f mm\n', p_M_check(2));
+fprintf('    z_M = %.6f mm\n', p_M_check(3));
+
+% 检查是否在非球面上
+z_M_theory = compute_aspherical_z(p_M_check(1), p_M_check(2), R, K, A4, A6);
+error_surface = abs(p_M_check(3) - z_M_theory);
+
+fprintf('  非球面约束:\n');
+fprintf('    理论Z: %.6f mm\n', z_M_theory);
+fprintf('    实际Z: %.6f mm\n', p_M_check(3));
+fprintf('    约束误差: %.2e mm ', error_surface);
+
+if error_surface < 1e-9
+    fprintf('✓\n');
+else
+    fprintf('✗ 误差过大!\n');
+end
+
+
+function z_W = compute_z_at_fixed_xy(x_W, y_W, R_true, t_true, R, K, A4, A6)
+    % 计算旋转平移后,机床坐标系固定XY点对应的非球面Z值
+    % 
+    % 输入:
+    %   x_W, y_W - 机床坐标系的XY坐标(固定)
+    %   R_true   - 工件旋转矩阵 (3×3)
+    %   t_true   - 工件平移向量 (3×1)
+    %   R, K, A4, A6 - 非球面参数
+    % 输出:
+    %   z_W - 对应的机床坐标系Z值
+    
+    % === 初始猜测 ===
+    % 方法1: 假设只有平移(小角度近似)
+    rho0 = sqrt(x_W^2 + y_W^2);
+    z_M0 = compute_aspherical_z(x_W, y_W, R, K, A4, A6);
+    z_W = z_M0 + t_true(3);  % 粗略初值
+    
+    % === Newton-Raphson迭代 ===
+    max_iter = 100;
+    tol = 1e-10;
+    R_inv = R_true';  % 预计算逆矩阵
+    
+    for iter = 1:max_iter
+        % 1. 构建当前机床坐标点
+        p_W = [x_W; y_W; z_W];
+        
+        % 2. 变换到工件坐标系
+        p_M = R_inv * (p_W - t_true);
+        x_M = p_M(1);
+        y_M = p_M(2);
+        z_M = p_M(3);
+        
+        % 3. 计算该点在非球面上的理论Z值
+        z_M_theory = compute_aspherical_z(x_M, y_M, R, K, A4, A6);
+        
+        if isnan(z_M_theory)
+            warning('点(%.1f, %.1f)超出非球面有效口径', x_W, y_W);
+            z_W = NaN;
+            return;
+        end
+        
+        % 4. 计算残差
+        residual = z_M - z_M_theory;
+        
+        % 5. 收敛判断
+        if abs(residual) < tol
+            return;  % 成功收敛
+        end
+        
+        % 6. 计算Jacobian矩阵
+        rho_M = sqrt(x_M^2 + y_M^2);
+        c = 1 / R;
+        discriminant = 1 - (1 + K) * c^2 * rho_M^2;
+        
+        if rho_M > 1e-8 && discriminant > 1e-10
+            % 计算 ∂f/∂ρ
+            sqrt_disc = sqrt(discriminant);
+            df_drho = (2*c*rho_M) / (1 + sqrt_disc) ...
+                      + (c^3*(1+K)*rho_M^3) / ((1+sqrt_disc)^2 * sqrt_disc) ...
+                      + 4*A4*rho_M^3 + 6*A6*rho_M^5;
+            
+            % 链式法则: ∂f/∂x_M, ∂f/∂y_M
+            if rho_M > 1e-8
+                df_dx = df_drho * (x_M / rho_M);
+                df_dy = df_drho * (y_M / rho_M);
+            else
+                df_dx = 0;
+                df_dy = 0;
+            end
+            
+            % 总Jacobian: dF/dz_W
+            % 由 p_M = R^T*(p_W - t) 可得:
+            % ∂x_M/∂z_W = R_inv(1,3)
+            % ∂y_M/∂z_W = R_inv(2,3)
+            % ∂z_M/∂z_W = R_inv(3,3)
+            J = R_inv(3,3) - df_dx*R_inv(1,3) - df_dy*R_inv(2,3);
+        else
+            % 中心点或奇异位置
+            J = R_inv(3,3);
+        end
+        
+        % 7. Newton更新
+        if abs(J) > 1e-12
+            z_W = z_W - residual / J;
+        else
+            warning('Jacobian接近奇异,迭代终止');
+            break;
+        end
+    end
+    
+    if iter == max_iter
+        warning('迭代未收敛 (x_W=%.1f, y_W=%.1f, 残差=%.2e)', ...
+                x_W, y_W, abs(residual));
+    end
+end
+
+function z = compute_aspherical_z(x, y, R, K, A4, A6)
+    % 非球面方程(式2.27)
+    rho = sqrt(x^2 + y^2);
+    c = 1 / R;
+    discriminant = 1 - (1 + K) * c^2 * rho^2;
+    
+    if discriminant >= 0
+        z = (c * rho^2) / (1 + sqrt(discriminant)) + ...
+            A4 * rho^4 + A6 * rho^6;
+    else
+        z = NaN;
+    end
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
